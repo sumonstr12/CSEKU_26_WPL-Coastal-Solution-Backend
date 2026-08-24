@@ -21,6 +21,8 @@ DEBUG = os.getenv('DEBUG')
 
 ALLOWED_HOSTS = []
 
+AUTH_USER_MODEL = 'users.USER'
+
 
 # Application definition
 
@@ -32,6 +34,10 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+
+    'users',
+
+
 
 ]
 
