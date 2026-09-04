@@ -1,0 +1,28 @@
+1.  POST   /api/auth/register/
+2.  POST   /api/auth/login/
+3.  POST   /api/auth/logout/
+4.  POST   /api/auth/token/refresh/
+
+5.  GET    /api/users/me/
+6.  PATCH  /api/users/me/
+7.  GET    /api/users/me/profile/
+8.  PATCH  /api/users/me/profile/
+
+9.  GET    /api/administrative-areas/
+10. GET    /api/administrative-areas/{id}/
+11. GET    /api/administrative-areas/{id}/children/
+
+12. GET    /api/roles/
+
+
+2nd Phase
+
+13. POST   /api/auth/password/forgot/
+14. POST   /api/auth/password/reset/
+15. PATCH  /api/users/me/password/
+
+16. GET    /api/admin/users/
+17. GET    /api/admin/users/{id}/
+18. PATCH  /api/admin/users/{id}/
+19. PATCH  /api/admin/users/{id}/status/
+20. PATCH  /api/admin/users/{id}/role/
