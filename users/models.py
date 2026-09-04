@@ -8,13 +8,23 @@ import uuid
 # Create your models here.
 
 class UserManager(BaseUserManager):
-    def create_user(self, username, email, password=None, **extra_fields):
+    def generate_unique_username(self):
+        while True:
+            candidate_username = f"cs_{random.randint(10000, 99999)}"
+            if not self.filter(username=candidate_username).exists():
+                return candidate_username
+
+    def create_user(self, phone_number, username=None, email=None, password=None, **extra_fields):
+        if not phone_number:
+            raise ValueError("User must have phone_number")
+
         if not username:
-            raise ValueError("Users must have a username")
-        if not email:
-            raise ValueError("Users must have an email address")
-        email = self.normalize_email(email)
+            username = self.generate_unique_username()
+
+        if email:
+            email = self.normalize_email(email)
         user = self.model(
+            phone_number=phone_number,
             username=username,
             email=email,
             **extra_fields
@@ -23,7 +33,7 @@ class UserManager(BaseUserManager):
         user.save(using=self._db)
         return user
 
-    def create_superuser(self, username, email, password, **extra_fields):
+    def create_superuser(self, phone_number, username=None, email=None, password=None, **extra_fields):
 
         extra_fields.setdefault("is_staff", True)
         extra_fields.setdefault("is_superuser", True)
@@ -40,9 +50,10 @@ class UserManager(BaseUserManager):
                 "Superuser must have is_superuser=True."
             )
         return self.create_user(
-            username,
-            email,
-            password,
+            phone_number=phone_number,
+            username=username,
+            email=email,
+            password=password,
             **extra_fields
         )
 
@@ -68,8 +79,8 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     username = models.CharField(max_length=255, unique=True)
     full_name = models.CharField(max_length=255)
-    email = models.EmailField(max_length=255, unique=True)
-    phone_number = models.CharField(max_length=255)
+    email = models.EmailField(max_length=255, unique=True, null=True, blank=True)
+    phone_number = models.CharField(max_length=255, unique=True)
     role = models.CharField(
         max_length=255,
         choices=Role.choices,
@@ -86,8 +97,8 @@ class User(AbstractBaseUser, PermissionsMixin):
     def __str__(self):
         return f"{self.full_name} role {self.role}"
 
-    USERNAME_FIELD = 'username'
-    REQUIRED_FIELDS = ['email']
+    USERNAME_FIELD = "phone_number"
+    REQUIRED_FIELDS = []
 
     objects = UserManager()
 
@@ -197,10 +208,8 @@ class ResponderProfile(models.Model):
         blank=True,
         null=True
     )
-    administrative_area = models.ForeignKey(
+    administrative_areas = models.ManyToManyField(
         "AdministrativeArea",
-        on_delete=models.SET_NULL,
-        null=True,
         blank=True,
         related_name="responders"
     )
