@@ -75,10 +75,13 @@ class User(AbstractBaseUser, PermissionsMixin):
         choices=Role.choices,
         default=Role.CITIZEN,
     )
+    date_of_birth = models.DateField(null=True, blank=True)
 
     date_joined = models.DateTimeField(auto_now_add=True)
     last_login = models.DateTimeField(auto_now=True)
     updated_at = models.DateTimeField(auto_now=True)
+    otp = models.CharField(max_length=6, blank=True, null=True)
+    otp_created_at = models.DateTimeField(auto_now=True, null=True, blank=True)
 
     def __str__(self):
         return f"{self.full_name} role {self.role}"
@@ -108,7 +111,7 @@ class AdministrativeArea(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     class Meta:
-        unique_together = ("name", "area_type", "parent")
+        unique_together = ("name", "area_type")
 
     def __str__(self):
         return f"{self.name} ({self.get_area_type_display()})"
