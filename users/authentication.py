@@ -7,15 +7,16 @@ User = get_user_model()
 
 class UserAuthenticationBackend(BaseBackend):
 
-    def authenticate(self, request, username=None, password=None, **kwargs):
+    def authenticate(self, request, username=None, password=None, phone_number=None, **kwargs):
 
-        if username is None or password is None:
+        if username is None or password is None or phone_number is None:
             return None
 
         try:
             user = User.objects.get(
                 Q(username=username) |
-                Q(email=username)
+                Q(email=username) |
+                Q(email=phone_number)
             )
         except User.DoesNotExist:
             return None
