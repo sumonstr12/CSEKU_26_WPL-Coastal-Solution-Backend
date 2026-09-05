@@ -3,67 +3,27 @@ from rest_framework import serializers
 from rest_framework.serializers import ModelSerializer
 from .models import *
 
-class UserRegistrationSerializer(ModelSerializer):
-    class Meta:
-        model = User
-        fields = ["username","email","password","full_name","phone_number","role", "date_of_birth"]
-        extra_kwargs = {
-            "password": {"write_only": True},
-            "date_of_birth": {"required": False, "allow_null": True}
-        }
+class RegisterRequestSerializer(serializers.Serializer):
+    phone_number = serializers.CharField(max_length=20)
+    password = serializers.CharField(write_only=True, min_length=6)
+    full_name = serializers.CharField(max_length=255)
+    role = serializers.ChoiceField(choices=User.Role.choices, default=User.Role.CITIZEN)
+    district = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    email = serializers.EmailField(required=False, allow_null=True, allow_blank=True)
 
-    def validate(self, data):
-        role = data["role"]
-        if role not in ["CITIZEN","COMMUNITY_VOLUNTEER", "RESPONDER", "LOCAL_AUTHORITY", "DISASTER_MANAGEMENT_OFFICER", "SYSTEM_ADMINISTRATOR"]:
-            return serializers.ValidationError(f'Role {role} not valid. Choose valid one.')
-
-        date_of_birth = data.get("date_of_birth")
-        if role != "CITIZEN" and not date_of_birth:
-            return serializers.ValidationError(f'Must be submit date of birth. Choose valid one.')
-
-        return data
+    def validate_phone_number(self, value):
+        if User.objects.filter(phone_number=value).exists():
+            raise serializers.ValidationError("This phone number is already registered.")
+        return value
 
 
-    def create(self, validated_data):
+class RegisterVerifySerializer(serializers.Serializer):
+    verification_id = serializers.UUIDField()
+    otp = serializers.CharField(max_length=6, min_length=6)
 
-        password = validated_data.pop("password")
 
-        user = User.objects.create_user(
-            password=password,
-            **validated_data
-        )
-
-        if user.role == User.Role.CITIZEN:
-            CitizenProfile.objects.create(
-                user=user
-            )
-
-        elif user.role == User.Role.COMMUNITY_VOLUNTEER:
-            CommunityVolunteerProfile.objects.create(
-                user=user
-            )
-
-        elif user.role == User.Role.RESPONDER:
-            ResponderProfile.objects.create(
-                user=user
-            )
-
-        elif user.role == User.Role.LOCAL_AUTHORITY:
-            LocalAuthorityProfile.objects.create(
-                user=user
-            )
-
-        elif user.role == User.Role.DISASTER_MANAGEMENT_OFFICER:
-            DisasterManagementOfficerProfile.objects.create(
-                user=user
-            )
-
-        elif user.role == User.Role.SYSTEM_ADMINISTRATOR:
-            SystemAdministratorProfile.objects.create(
-                user=user
-            )
-
-        return user
+class RegisterResendSerializer(serializers.Serializer):
+    verification_id = serializers.UUIDField()
 
 class AdministrativeAreaSerializer(serializers.ModelSerializer):
     parent_name = serializers.CharField(

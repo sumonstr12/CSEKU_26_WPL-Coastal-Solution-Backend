@@ -7,29 +7,25 @@ User = get_user_model()
 
 class UserAuthenticationBackend(BaseBackend):
 
-    def authenticate(self, request, username=None, password=None, phone_number=None, **kwargs):
+    def authenticate(self, request, username=None, password=None, **kwargs):
+        identifier = username or kwargs.get("phone_number")
 
-        if username is None or password is None or phone_number is None:
+        if identifier is None or password is None:
             return None
-
         try:
             user = User.objects.get(
-                Q(username=username) |
-                Q(email=username) |
-                Q(email=phone_number)
+                Q(phone_number=identifier) |
+                Q(username=identifier) |
+                Q(email=identifier)
             )
-        except User.DoesNotExist:
+        except (User.DoesNotExist, User.MultipleObjectsReturned):
             return None
-        except User.MultipleObjectsReturned:
-            return None
-
         if user.check_password(password) and user.is_active:
             return user
 
         return None
 
     def get_user(self, user_id):
-
         try:
             return User.objects.get(pk=user_id)
         except User.DoesNotExist:

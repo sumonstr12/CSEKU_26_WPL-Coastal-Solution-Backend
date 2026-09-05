@@ -1,11 +1,47 @@
+
+import uuid
+import hashlib
+import random
 from django.db import models
 from django.contrib.auth.models import (
     AbstractBaseUser, BaseUserManager, PermissionsMixin, UserManager
 )
-from datetime import datetime, timezone
-import uuid
+from datetime import timedelta
+from django.utils import timezone
+
 
 # Create your models here.
+
+class PendingRegistration(models.Model):
+    verification_id = models.UUIDField(default=uuid.uuid4, editable=False, unique=True, primary_key=True)
+    phone_number = models.CharField(max_length=20, db_index=True)
+    full_name = models.CharField(max_length=255)
+    password_hash = models.CharField(max_length=255)  # Django encrypted password
+    role = models.CharField(max_length=50, default="CITIZEN")
+    email = models.EmailField(null=True, blank=True)
+    district = models.CharField(max_length=100, blank=True, null=True)
+
+    otp_hash = models.CharField(max_length=255)
+    attempts = models.IntegerField(default=0)
+    max_attempts = models.IntegerField(default=5)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    last_otp_sent_at = models.DateTimeField(auto_now=True)
+
+    def is_expired(self):
+        return timezone.now() > self.expires_at
+
+    @staticmethod
+    def hash_otp(otp_code: str) -> str:
+        return hashlib.sha256(otp_code.encode('utf-8')).hexdigest()
+
+    def set_otp(self, otp_code: str, validity_minutes=5):
+        self.otp_hash = self.hash_otp(otp_code)
+        self.expires_at = timezone.now() + timedelta(minutes=validity_minutes)
+        self.last_otp_sent_at = timezone.now()
+        self.attempts = 0
+
 
 class UserManager(BaseUserManager):
     def generate_unique_username(self):
@@ -87,6 +123,7 @@ class User(AbstractBaseUser, PermissionsMixin):
         default=Role.CITIZEN,
     )
     date_of_birth = models.DateField(null=True, blank=True)
+    district = models.CharField(max_length=100, blank=True, null=True)
 
     date_joined = models.DateTimeField(auto_now_add=True)
     last_login = models.DateTimeField(auto_now=True)

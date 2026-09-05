@@ -50,6 +50,8 @@ INSTALLED_APPS = [
     'corsheaders',
 
     'users',
+    'incidents',
+    'alert_notifications',
 
 
 
