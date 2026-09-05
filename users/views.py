@@ -1,6 +1,8 @@
 import random
 
-from django.contrib.auth import authenticate
+from django.contrib.auth import authenticate, get_user_model
+from django.contrib.auth.hashers import make_password
+from django.contrib.auth.base_user import AbstractBaseUser
 from django.shortcuts import render
 from rest_framework import viewsets, status
 from rest_framework.response import Response
@@ -17,25 +19,158 @@ from Utilis.templates import *
 from datetime import timedelta
 from django.utils import timezone
 
+from healper_functions.register_helper import *
 
+User = get_user_model()
 
 
 # Create your views here.
-class UserRegisterView(APIView):
+class RegisterRequestView(APIView):
+    permission_classes = []
+
     def post(self, request):
+        serializer = RegisterRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response({"status": False, "errors": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        data = serializer.validated_data
+        phone_number = data["phone_number"]
+
+        PendingRegistration.objects.filter(phone_number=phone_number).delete()
+
+        otp_code = str(random.randint(100000, 999999))
+
+        pending = PendingRegistration(
+            phone_number=phone_number,
+            full_name=data["full_name"],
+            password_hash=data["password"],  # প্লেইন পাসওয়ার্ড রাখছেন (make_password বাদ দিন)
+            role=data.get("role", User.Role.CITIZEN),
+            district=data.get("district"),
+            email=data.get("email")
+        )
+        pending.set_otp(otp_code, validity_minutes=5)
+        pending.save()
+
+        send_sms(phone_number, otp_code)
+
+        return Response({
+            "status": True,
+            "message": "Verification code sent to your phone number.",
+            "verification_id": str(pending.verification_id)
+        }, status=status.HTTP_200_OK)
+
+class RegisterVerifyView(APIView):
+    permission_classes = []
+    def post(self, request):
+        serializer = RegisterVerifySerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response({"status": False, "errors": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        verification_id = serializer.validated_data["verification_id"]
+        input_otp = serializer.validated_data["otp"]
+
         try:
-            serializer = UserRegistrationSerializer(data=request.data)
-            if serializer.is_valid():
-                serializer.save()
-                return Response(
-                    {
-                        "status": True,
-                        "message": "Registration successfull.",
-                    }, status=status.HTTP_201_CREATED
-                )
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            pending = PendingRegistration.objects.get(verification_id=verification_id)
+        except PendingRegistration.DoesNotExist:
+            return Response({"status": False, "message": "Invalid or expired verification session."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Expiration Check
+        if pending.is_expired():
+            pending.delete()
+            return Response({"status": False, "message": "OTP has expired. Please request a new one."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Max Attempts Check
+        if pending.attempts >= pending.max_attempts:
+            pending.delete()
+            return Response({"status": False, "message": "Too many failed attempts. Registration session terminated."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Hash Match Check
+        if pending.otp_hash != PendingRegistration.hash_otp(input_otp):
+            pending.attempts += 1
+            pending.save(update_fields=["attempts"])
+            return Response({"status": False, "message": f"Invalid OTP. Remaining attempts: {pending.max_attempts - pending.attempts}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check phone unique constraint again before creating user
+        if User.objects.filter(phone_number=pending.phone_number).exists():
+            pending.delete()
+            return Response({"status": False, "message": "Phone number is already registered."}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = User.objects.create_user(
+            phone_number=pending.phone_number,
+            full_name=pending.full_name,
+            password=pending.password_hash,
+            role=pending.role,
+            district=pending.district,
+            email=pending.email
+        )
+        # Auto Create Profile according to Role
+        create_role_profile(user)
+        # Remove temporary pending record
+        pending.delete()
+
+        refresh = RefreshToken.for_user(user)
+        access_token = str(refresh.access_token)
+        refresh_token = str(refresh)
+
+        response = Response({
+            "status": True,
+            "message": "Registration verified successfully.",
+            "user": {
+                "id": user.id,
+                "phone_number": user.phone_number,
+                "full_name": user.full_name,
+                "role": user.role
+            },
+            "token": access_token,
+            "refresh_token": refresh_token
+        }, status=status.HTTP_201_CREATED)
+
+        # HTTP-Only Cookie for Refresh Token
+        response.set_cookie(
+            key="refresh_token",
+            value=refresh_token,
+            secure=True,
+            httponly=True,
+            max_age=30 * 24 * 60 * 60,
+            samesite="strict"
+        )
+
+        return response
+
+
+
+class RegisterResendView(APIView):
+    permission_classes = []
+    def post(self, request):
+        serializer = RegisterResendSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response({"status": False, "errors": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        verification_id = serializer.validated_data["verification_id"]
+
+        try:
+            pending = PendingRegistration.objects.get(verification_id=verification_id)
+        except PendingRegistration.DoesNotExist:
+            return Response({"status": False, "message": "Invalid verification session."}, status=status.HTTP_400_BAD_REQUEST)
+
+        time_since_last_otp = (timezone.now() - pending.last_otp_sent_at).total_seconds()
+        if time_since_last_otp < 60:
+            remaining_time = int(60 - time_since_last_otp)
+            return Response({
+                "status": False,
+                "message": f"Please wait {remaining_time} seconds before requesting a new OTP."
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+        new_otp = str(random.randint(100000, 999999))
+        pending.set_otp(new_otp, validity_minutes=5)
+        pending.save()
+
+        send_sms(pending.phone_number, new_otp)
+
+        return Response({
+            "status": True,
+            "message": "A new verification code has been sent."
+        }, status=status.HTTP_200_OK)
 
 
 class UserLoginView(APIView):
