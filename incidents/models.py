@@ -598,6 +598,7 @@ def evidence_upload_path(instance, filename):
 
     return (
         f"incidents/"
+        f"evidence_{instance.incident_id}"
         f"{instance.incident_id}/"
         f"{filename}"
     )
