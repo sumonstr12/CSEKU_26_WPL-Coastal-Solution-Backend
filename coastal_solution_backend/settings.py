@@ -52,6 +52,7 @@ INSTALLED_APPS = [
     'users',
     'incidents',
     'alert_notifications',
+    'dashboard',
 
 
 

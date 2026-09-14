@@ -6,6 +6,7 @@ from django.conf.urls.static import static
 api_urlpatterns = [
     path("",include("users.urls")),
     path("", include("incidents.urls")),
+    path("dashboard/", include("dashboard.urls")),
 ]
 
 urlpatterns = [
