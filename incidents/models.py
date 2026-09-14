@@ -1290,3 +1290,175 @@ class ResponseAction(models.Model):
             f"{self.action_type} "
             f"- Assignment #{self.assignment_id}"
         )
+
+class Shelter(models.Model):
+
+    STATUS_CHOICES = (
+        ("OPEN", "Open"),
+        ("CLOSED", "Closed"),
+        ("CROWDED", "Crowded"),
+        ("FULL", "Full"),
+        ("READY", "Ready"),
+        ("MAINTENANCE", "Maintenance"),
+    )
+
+    # =====================================================
+    # IDENTITY
+    # =====================================================
+
+    id = models.CharField(
+        max_length=20,
+        primary_key=True
+    )
+
+    name = models.CharField(
+        max_length=255
+    )
+
+    # =====================================================
+    # LOCATION
+    # =====================================================
+
+    division = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True
+    )
+
+    district = models.CharField(
+        max_length=100
+    )
+
+    upazila = models.CharField(
+        max_length=100
+    )
+
+    union = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True
+    )
+
+    village = models.CharField(
+        max_length=150,
+        blank=True,
+        null=True
+    )
+
+    address = models.TextField(
+        blank=True,
+        null=True
+    )
+
+    latitude = models.FloatField(
+        blank=True,
+        null=True
+    )
+
+    longitude = models.FloatField(
+        blank=True,
+        null=True
+    )
+
+    # =====================================================
+    # CAPACITY
+    # =====================================================
+
+    capacity = models.PositiveIntegerField(
+        default=0
+    )
+
+    occupied = models.PositiveIntegerField(
+        default=0
+    )
+
+    # =====================================================
+    # STATUS
+    # =====================================================
+
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="READY"
+    )
+
+    is_active = models.BooleanField(
+        default=True
+    )
+
+    # =====================================================
+    # FACILITIES
+    # =====================================================
+
+    facilities = models.JSONField(
+        default=list,
+        blank=True
+    )
+
+    water = models.BooleanField(
+        default=False
+    )
+
+    power = models.BooleanField(
+        default=False
+    )
+
+    # =====================================================
+    # ADDITIONAL INFORMATION
+    # =====================================================
+
+    contact_person = models.CharField(
+        max_length=150,
+        blank=True,
+        null=True
+    )
+
+    contact_phone = models.CharField(
+        max_length=30,
+        blank=True,
+        null=True
+    )
+
+    construction_year = models.CharField(
+        max_length=50,
+        blank=True,
+        null=True
+    )
+
+    constructed_by = models.CharField(
+        max_length=150,
+        blank=True,
+        null=True
+    )
+
+    # =====================================================
+    # TIMESTAMPS
+    # =====================================================
+
+    created_at = models.DateTimeField(
+        auto_now_add=True
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True
+    )
+
+    class Meta:
+        ordering = ["district", "upazila", "name"]
+
+    def __str__(self):
+        return f"{self.id} - {self.name}"
+
+    @property
+    def available_capacity(self):
+        return max(self.capacity - self.occupied, 0)
+
+    @property
+    def occupancy_percentage(self):
+        if self.capacity <= 0:
+            return 0
+
+        return round(
+            (self.occupied / self.capacity) * 100,
+            2
+        )
