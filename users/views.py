@@ -196,7 +196,9 @@ class UserLoginView(APIView):
                 response.set_cookie(
                     key="refresh_token",
                     value=refresh_token,
-                    secure=True,
+                    # Browsers reject Secure cookies on local HTTP. On HTTPS
+                    # deployments the cookie remains Secure automatically.
+                    secure=request.is_secure(),
                     httponly=True,
                     max_age=30 * 24 * 60 * 60,
                     samesite="strict"
