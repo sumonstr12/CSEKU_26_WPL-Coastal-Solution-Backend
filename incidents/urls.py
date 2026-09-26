@@ -1,7 +1,7 @@
 from django.urls import path
 from .views import *
 
-urlpatterns = {
+urlpatterns = [
 
     #     # INCIDENT REPORT
     #     path('incidents/', IncidentReportListView.as_view(), name='incident-list'),
@@ -54,4 +54,4 @@ urlpatterns = {
     path("incidents/", IncidentReportListView.as_view(), name="incident-list"),
     path("incidents/create/", IncidentReportCreateView.as_view(), name="incident-create"),
     path("incidents/<int:pk>/", IncidentReportDetailView.as_view(), name="incident-detail"),
-}
+]
