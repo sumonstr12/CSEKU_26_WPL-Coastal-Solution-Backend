@@ -170,8 +170,47 @@ class IncidentReportCreateView(APIView):
 class IncidentReportListView(APIView):
     def get(self, request):
 
+        incident_queryset = IncidentReport.objects.all()
+        if (
+            request.user.is_authenticated
+            and request.user.role == "COMMUNITY_VOLUNTEER"
+        ):
+            volunteer = getattr(request.user, "volunteer_profile", None)
+            assigned_area = volunteer.administrative_area if volunteer else None
+
+            area_nodes = []
+            node = assigned_area
+            while node:
+                area_nodes.append(node)
+                node = node.parent
+
+            district = next(
+                (area.name for area in area_nodes if area.area_type == "DISTRICT"),
+                None,
+            )
+            upazila = next(
+                (area.name for area in area_nodes if area.area_type == "UPAZILA"),
+                None,
+            )
+
+            if district and upazila:
+                incident_queryset = incident_queryset.filter(
+                    district__iexact=district,
+                    upazila__iexact=upazila,
+                )
+            elif district:
+                incident_queryset = incident_queryset.filter(
+                    district__iexact=district,
+                )
+            elif upazila:
+                incident_queryset = incident_queryset.filter(
+                    upazila__iexact=upazila,
+                )
+            else:
+                incident_queryset = IncidentReport.objects.none()
+
         incidents = (
-            IncidentReport.objects
+            incident_queryset
             .select_related(
                 "category",
                 "reporter",

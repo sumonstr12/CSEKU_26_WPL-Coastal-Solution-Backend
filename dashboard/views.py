@@ -1,17 +1,26 @@
 # dashboard/views.py
 from math import radians, sin, cos, asin, sqrt
 
-from django.db.models import Q
+from django.db.models import Q, Sum
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.exceptions import NotFound, PermissionDenied
 
 from alert_notifications.models import Alert, NotificationLog
-from incidents.models import IncidentReport, Shelter
+from incidents.models import IncidentReport, ResponseAction, ResponseAssignment, Shelter
 from dashboard.district_coords import get_district_coords
+from users.permissions import IsCommunityVolunteer
 
-from .serializers import CitizenOverviewSerializer
+from .serializers import (
+    CitizenOverviewSerializer,
+    VolunteerOverviewSerializer,
+    VolunteerShelterSerializer,
+    VolunteerTaskCompletionSerializer,
+    VolunteerTaskSerializer,
+)
 
 
 # ============================================================
@@ -336,3 +345,341 @@ class CitizenOverviewView(APIView):
 
         serializer = CitizenOverviewSerializer(payload)
         return Response(serializer.data)
+
+
+class VolunteerOverviewView(APIView):
+    permission_classes = [IsAuthenticated, IsCommunityVolunteer]
+
+    def get(self, request, *args, **kwargs):
+        now = timezone.now()
+        volunteer = getattr(request.user, "volunteer_profile", None)
+        assigned_area = volunteer.administrative_area if volunteer else None
+
+        area_nodes = []
+        node = assigned_area
+        while node:
+            area_nodes.append(node)
+            node = node.parent
+
+        district = next(
+            (area.name for area in area_nodes if area.area_type == "DISTRICT"),
+            None,
+        )
+        upazila = next(
+            (area.name for area in area_nodes if area.area_type == "UPAZILA"),
+            None,
+        )
+
+        area_reports = IncidentReport.objects.none()
+        area_shelters = Shelter.objects.none()
+        if upazila and district:
+            area_reports = IncidentReport.objects.filter(
+                district__iexact=district,
+                upazila__iexact=upazila,
+            )
+            area_shelters = Shelter.objects.filter(
+                is_active=True,
+                district__iexact=district,
+                upazila__iexact=upazila,
+            ).exclude(status="CLOSED")
+        elif district:
+            area_reports = IncidentReport.objects.filter(district__iexact=district)
+            area_shelters = Shelter.objects.filter(
+                is_active=True,
+                district__iexact=district,
+            ).exclude(status="CLOSED")
+        elif upazila:
+            area_reports = IncidentReport.objects.filter(upazila__iexact=upazila)
+            area_shelters = Shelter.objects.filter(
+                is_active=True,
+                upazila__iexact=upazila,
+            ).exclude(status="CLOSED")
+
+        active_reports = area_reports.exclude(
+            status__in=["resolved", "closed", "rejected", "duplicate"]
+        )
+        pending_reports = area_reports.filter(status__in=["submitted", "under_review"])
+
+        assignments = ResponseAssignment.objects.none()
+        active_assignments = ResponseAssignment.objects.none()
+        if volunteer:
+            assignments = (
+                ResponseAssignment.objects
+                .filter(assigned_volunteer=volunteer)
+                .exclude(status__in=["declined", "cancelled"])
+                .select_related("incident", "incident__category")
+            )
+            active_assignments = assignments.exclude(status="completed")
+
+        alerts = []
+        if district or upazila:
+            valid_alerts = Alert.objects.filter(
+                is_active=True,
+                is_verified=True,
+                valid_from__lte=now,
+            ).filter(Q(valid_until__isnull=True) | Q(valid_until__gte=now))
+            alerts = [
+                alert for alert in valid_alerts
+                if alert_matches_district(alert, district)
+                or alert_matches_upazila(alert, upazila)
+            ]
+            alerts.sort(
+                key=lambda alert: (
+                    SEVERITY_RANK.get(alert.severity, 0),
+                    alert.published_at,
+                ),
+                reverse=True,
+            )
+        alert = alerts[0] if alerts else None
+
+        incidents_count = active_reports.count()
+        shelter_count = area_shelters.count()
+        volunteer_count = (
+            assigned_area.volunteers.count() if assigned_area else 0
+        )
+        affected_people = active_reports.aggregate(
+            total=Sum("affected_people_estimate")
+        )["total"] or 0
+
+        stats = [
+            {
+                "key": "incidents",
+                "label": "স্থানীয় সক্রিয় ঘটনা",
+                "value": incidents_count,
+                "hint": "আপনার নির্ধারিত এলাকায়",
+                "tone": "amber",
+                "icon": "Activity",
+            },
+            {
+                "key": "pending",
+                "label": "অপেক্ষমাণ রিপোর্ট",
+                "value": pending_reports.count(),
+                "hint": "যাচাই প্রয়োজন",
+                "tone": "lagoon",
+                "icon": "ClipboardList",
+            },
+            {
+                "key": "tasks",
+                "label": "নির্ধারিত কার্যক্রম",
+                "value": active_assignments.count(),
+                "hint": "আপনার জন্য বরাদ্দ",
+                "tone": "sky",
+                "icon": "ListChecks",
+            },
+            {
+                "key": "people",
+                "label": "সহায়তাপ্রয়োজন মানুষ",
+                "value": affected_people,
+                "hint": "সক্রিয় এলাকার রিপোর্ট অনুযায়ী",
+                "tone": "emerald",
+                "icon": "HandHeart",
+            },
+        ]
+
+        community_reports = (
+            area_reports.select_related("category", "reporter")
+            .order_by("-report_time")[:5]
+        )
+
+        activities = []
+        kind_map = {
+            "report_submission": "report",
+            "report_update": "report",
+            "alert": "alert",
+            "critical_alert": "alert",
+            "assignment": "mission",
+            "reminder": "system",
+            "broadcast": "system",
+        }
+        for notification in NotificationLog.objects.filter(
+            recipient=request.user
+        ).select_related("incident", "alert").order_by("-created_at")[:8]:
+            if notification.incident_id:
+                incident = notification.incident
+                place = ", ".join(
+                    part for part in [incident.upazila, incident.district] if part
+                )
+            elif notification.alert_id:
+                place = ", ".join(
+                    (notification.alert.affected_upazilas or [])
+                    + (notification.alert.affected_districts or [])
+                )
+            else:
+                place = ", ".join(part for part in [upazila, district] if part)
+            activities.append({
+                "id": f"notification-{notification.id}",
+                "kind": kind_map.get(notification.notification_type, "system"),
+                "title": notification.subject,
+                "place": place,
+                "time": notification.created_at,
+            })
+
+        for action in (
+            ResponseAction.objects
+            .filter(assignment__assigned_volunteer=volunteer)
+            .select_related("assignment__incident")
+            .order_by("-action_time")[:8]
+        ) if volunteer else []:
+            incident = action.assignment.incident
+            activities.append({
+                "id": f"response-action-{action.id}",
+                "kind": "mission",
+                "title": action.description_bn or action.description,
+                "place": ", ".join(
+                    part for part in [incident.upazila, incident.district] if part
+                ),
+                "time": action.action_time,
+            })
+
+        for incident in area_reports.select_related("category").order_by("-created_at")[:8]:
+            activities.append({
+                "id": f"incident-{incident.id}",
+                "kind": "report",
+                "title": incident.title_bn or incident.title or incident.category.name,
+                "place": ", ".join(
+                    part for part in [incident.upazila, incident.district] if part
+                ),
+                "time": incident.created_at,
+            })
+
+        activities.sort(key=lambda activity: activity["time"], reverse=True)
+
+        payload = {
+            "stats": stats,
+            "alert": alert,
+            "tasks": assignments,
+            "communityReports": community_reports,
+            "activities": activities[:8],
+            "area": {
+                "district": district,
+                "upazila": upazila,
+                "incidents": incidents_count,
+                "shelters": shelter_count,
+                "volunteers": volunteer_count,
+            },
+        }
+        serializer = VolunteerOverviewSerializer(payload)
+        return Response(serializer.data)
+
+
+class VolunteerShelterListView(APIView):
+    permission_classes = [IsAuthenticated, IsCommunityVolunteer]
+
+    def get(self, request, *args, **kwargs):
+        volunteer = getattr(request.user, "volunteer_profile", None)
+        assigned_area = volunteer.administrative_area if volunteer else None
+
+        area_nodes = []
+        node = assigned_area
+        while node:
+            area_nodes.append(node)
+            node = node.parent
+
+        district = next(
+            (area.name for area in area_nodes if area.area_type == "DISTRICT"),
+            None,
+        )
+        upazila = next(
+            (area.name for area in area_nodes if area.area_type == "UPAZILA"),
+            None,
+        )
+
+        incident = None
+        incident_id = request.query_params.get("incident")
+        if incident_id is not None:
+            try:
+                incident_id = int(incident_id)
+            except (TypeError, ValueError):
+                raise NotFound("Incident not found.")
+
+            authorized_incidents = IncidentReport.objects.none()
+            if upazila and district:
+                authorized_incidents = IncidentReport.objects.filter(
+                    district__iexact=district,
+                    upazila__iexact=upazila,
+                )
+            elif district:
+                authorized_incidents = IncidentReport.objects.filter(
+                    district__iexact=district,
+                )
+            elif upazila:
+                authorized_incidents = IncidentReport.objects.filter(
+                    upazila__iexact=upazila,
+                )
+
+            incident = get_object_or_404(
+                authorized_incidents.select_related("category"),
+                pk=incident_id,
+            )
+            district = incident.district
+            upazila = incident.upazila
+
+        shelters = Shelter.objects.none()
+        if upazila and district:
+            shelters = Shelter.objects.filter(
+                is_active=True,
+                district__iexact=district,
+                upazila__iexact=upazila,
+            ).exclude(status="CLOSED")
+        elif district:
+            shelters = Shelter.objects.filter(
+                is_active=True,
+                district__iexact=district,
+            ).exclude(status="CLOSED")
+        elif upazila:
+            shelters = Shelter.objects.filter(
+                is_active=True,
+                upazila__iexact=upazila,
+            ).exclude(status="CLOSED")
+
+        serializer = VolunteerShelterSerializer(shelters, many=True)
+        payload = {
+            "success": True,
+            "count": shelters.count(),
+            "data": serializer.data,
+        }
+        if incident is not None:
+            payload["incident"] = {
+                "id": incident.id,
+                "title": incident.title,
+                "title_bn": incident.title_bn,
+                "category": {
+                    "name": incident.category.name,
+                    "name_bn": incident.category.name_bn,
+                },
+                "district": incident.district,
+                "upazila": incident.upazila,
+            }
+        return Response(payload)
+
+
+class VolunteerTaskStatusUpdateView(APIView):
+    """Allows a community volunteer to complete one of their assignments."""
+
+    permission_classes = [IsAuthenticated, IsCommunityVolunteer]
+
+    def patch(self, request, pk, *args, **kwargs):
+        input_serializer = VolunteerTaskCompletionSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+
+        volunteer = getattr(request.user, "volunteer_profile", None)
+        if volunteer is None:
+            raise PermissionDenied("A community volunteer profile is required.")
+        assignment = get_object_or_404(
+            ResponseAssignment.objects.select_related("incident", "incident__category"),
+            pk=pk,
+            assigned_volunteer=volunteer,
+        )
+
+        if assignment.status in {"cancelled", "declined"}:
+            return Response(
+                {"status": "A cancelled or declined task cannot be completed."},
+                status=400,
+            )
+
+        # Completing an already completed assignment is deliberately idempotent.
+        if assignment.status != "completed":
+            assignment.status = "completed"
+            assignment.save(update_fields=["status", "updated_at"])
+
+        return Response(VolunteerTaskSerializer(assignment).data)
