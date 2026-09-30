@@ -1,4 +1,4 @@
-from django.urls import path
+from django.urls import path, include
 from .views import *
 from users.jwt_token.views import CookieTokenRefreshView
 
@@ -23,6 +23,8 @@ urlpatterns = [
 
     path('token/get-refresh/', CookieTokenRefreshView.as_view()),
 
+
+    path("profiles/", include("users.profiles.profile_urls")),
 
 
 ]
