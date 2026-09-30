@@ -319,3 +319,81 @@ class VolunteerOverviewSerializer(serializers.Serializer):
     communityReports = VolunteerCommunityReportSerializer(many=True)
     activities = VolunteerActivitySerializer(many=True)
     area = VolunteerAreaSerializer()
+
+# code for week 5(sumon)
+# ============================================================
+# OFFICER DASHBOARD
+# ============================================================
+
+class OfficerStatCardSerializer(serializers.Serializer):
+    key = serializers.CharField()
+    label = serializers.CharField()
+    value = serializers.IntegerField()
+    tone = serializers.CharField()
+    icon = serializers.CharField()
+    hint = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
+class ChartSliceSerializer(serializers.Serializer):
+    label = serializers.CharField()
+    value = serializers.IntegerField()
+    color = serializers.CharField(required=False, allow_blank=True)
+
+
+class DistrictRiskSerializer(serializers.Serializer):
+    district = serializers.CharField()
+    risk = serializers.IntegerField()
+    reports = serializers.IntegerField(required=False)
+    trend = serializers.CharField(required=False, allow_blank=True)
+
+
+class RegionOverviewSerializer(serializers.Serializer):
+    name = serializers.CharField()
+    alerts = serializers.IntegerField()
+    highRisk = serializers.IntegerField()
+    pending = serializers.IntegerField()
+    districts = DistrictRiskSerializer(many=True)
+
+
+class OfficerAlertSerializer(serializers.Serializer):
+    title = serializers.CharField()
+    type = serializers.CharField()
+    severity = serializers.CharField()
+    areas = serializers.ListField(child=serializers.CharField())
+    startedAt = serializers.IntegerField(allow_null=True)
+    signal = serializers.CharField(allow_null=True, required=False)
+    source = serializers.CharField(allow_null=True, required=False)
+
+
+class PriorityReportRowSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    type = serializers.CharField()
+    title = serializers.CharField()
+    description = serializers.CharField(allow_blank=True)
+    district = serializers.CharField(allow_blank=True)
+    upazila = serializers.CharField(allow_blank=True)
+    severity = serializers.CharField()
+    status = serializers.CharField()
+    incident_time = serializers.DateTimeField(allow_null=True)
+    time = serializers.DateTimeField(allow_null=True)
+    affected = serializers.IntegerField(allow_null=True)
+    category = serializers.DictField(required=False)
+
+
+class OperationRowSerializer(serializers.Serializer):
+    id = serializers.CharField()
+    title = serializers.CharField()
+    district = serializers.CharField(allow_blank=True)
+    teams = serializers.IntegerField()
+    rescued = serializers.IntegerField()
+    status = serializers.CharField()
+
+
+class OfficerOverviewSerializer(serializers.Serializer):
+    alert = OfficerAlertSerializer(allow_null=True)
+    stats = OfficerStatCardSerializer(many=True)
+    region = RegionOverviewSerializer()
+    reportsByType = ChartSliceSerializer(many=True)
+    monthlyTrend = ChartSliceSerializer(many=True)
+    priorityReports = PriorityReportRowSerializer(many=True)
+    operations = OperationRowSerializer(many=True)
