@@ -1078,16 +1078,6 @@ class ResponseAssignment(models.Model):
         ResponderProfile,
         on_delete=models.CASCADE,
         related_name="response_assignments",
-        blank=True,
-        null=True,
-    )
-
-    assigned_volunteer = models.ForeignKey(
-        CommunityVolunteerProfile,
-        on_delete=models.CASCADE,
-        related_name="response_assignments",
-        blank=True,
-        null=True,
     )
 
     assigned_by = models.ForeignKey(
@@ -1142,28 +1132,10 @@ class ResponseAssignment(models.Model):
             models.Index(
                 fields=["assigned_to", "status"]
             ),
-            models.Index(
-                fields=["assigned_volunteer", "status"]
-            ),
-        ]
-
-        constraints = [
-            models.CheckConstraint(
-                condition=(
-                    models.Q(assigned_to__isnull=False, assigned_volunteer__isnull=True)
-                    | models.Q(assigned_to__isnull=True, assigned_volunteer__isnull=False)
-                ),
-                name="response_assignment_one_assignee",
-            ),
         ]
 
     def clean(self):
         super().clean()
-
-        if (self.assigned_to_id is None) == (self.assigned_volunteer_id is None):
-            raise ValidationError(
-                "Exactly one responder or community volunteer must be assigned."
-            )
 
         if (
             self.response_deadline

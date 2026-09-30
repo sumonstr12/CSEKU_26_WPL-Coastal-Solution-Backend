@@ -1,10 +1,5 @@
 from django.urls import path
 from .views import *
-from alert_notifications.views import (
-    NotificationListView,
-    NotificationReadView,
-    NotificationReadAllView,
-)
 
 urlpatterns = [
 
@@ -46,10 +41,10 @@ urlpatterns = [
     #     path('alerts/active/', ActiveAlertListView.as_view(), name='alert-active'),
     #     path('alerts/<int:pk>/deactivate/', AlertDeactivateView.as_view(), name='alert-deactivate'),
     #
-    # NOTIFICATION
-    path('notifications/', NotificationListView.as_view(), name='notification-list'),
-    path('notifications/<int:pk>/read/', NotificationReadView.as_view(), name='notification-read'),
-    path('notifications/read-all/', NotificationReadAllView.as_view(), name='notification-read-all'),
+    #     # NOTIFICATION
+    #     path('notifications/', NotificationListView.as_view(), name='notification-list'),
+    #     path('notifications/<int:pk>/read/', NotificationReadView.as_view(), name='notification-read'),
+    #     path('notifications/read-all/', NotificationReadAllView.as_view(), name='notification-read-all'),
     #
     #     # INCIDENT CATEGORIES
     #     path('categories/', IncidentCategoryListView.as_view(), name='category-list'),

@@ -14,18 +14,6 @@ from .officer_views import (
 
 urlpatterns = [
     path('citizen/overview/', CitizenOverviewView.as_view(), name='dashboard-overview'),
-    path('volunteer/overview/', VolunteerOverviewView.as_view(), name='volunteer-dashboard-overview'),
-    path(
-        'volunteer/shelters/',
-        VolunteerShelterListView.as_view(),
-        name='volunteer-shelter-list',
-    ),
-    path(
-        'volunteer/tasks/<int:pk>/status/',
-        VolunteerTaskStatusUpdateView.as_view(),
-        name='volunteer-task-status-update',
-    ),
-]
     path('officer/overview/', OfficerOverviewView.as_view(), name='officer-dashboard-overview'),
 
     path('officer/badges/', OfficerBadgeView.as_view(), name='officer-badges'),
