@@ -9,3 +9,7 @@ pillow
 requests
 beautifulsoup4
 geopy
+psycopg2
+psycopg2-binary
+supabase
+ffmpeg-python

@@ -605,11 +605,6 @@ def evidence_upload_path(instance, filename):
 
 
 class EvidenceAttachment(models.Model):
-    """
-    Stores photos, videos, audio, and documents
-    related to an incident.
-    """
-
     FILE_TYPE_CHOICES = (
         ("photo", "Photo"),
         ("video", "Video"),
@@ -631,34 +626,35 @@ class EvidenceAttachment(models.Model):
         null=True,
     )
 
-    file = models.FileField(
-        upload_to=evidence_upload_path,
-        validators=[
-            FileExtensionValidator(
-                allowed_extensions=[
-                    "jpg",
-                    "jpeg",
-                    "png",
-                    "webp",
-                    "mp4",
-                    "mov",
-                    "avi",
-                    "mp3",
-                    "wav",
-                    "pdf",
-                    "doc",
-                    "docx",
-                ]
-            )
-        ],
-    )
 
     file_name = models.CharField(
         max_length=255,
         blank=True,
     )
 
+    original_file_name = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+    )
+
+    file_path = models.CharField(
+        max_length=1000,
+        blank=True,
+        default=""
+    )
+
+    file_url = models.URLField(
+        max_length=1000,
+        blank=True,
+        default=""
+    )
+
     file_size = models.PositiveBigIntegerField(
+        default=0,
+    )
+
+    original_file_size = models.PositiveBigIntegerField(
         default=0,
     )
 
@@ -673,11 +669,21 @@ class EvidenceAttachment(models.Model):
         null=True,
     )
 
-    thumbnail = models.ImageField(
-        upload_to="incidents/thumbnails/",
+
+
+    thumbnail_path = models.CharField(
+        max_length=1000,
         blank=True,
         null=True,
     )
+
+    thumbnail_url = models.URLField(
+        max_length=2000,
+        blank=True,
+        null=True,
+    )
+
+
 
     description = models.TextField(
         blank=True,
@@ -688,6 +694,7 @@ class EvidenceAttachment(models.Model):
         blank=True,
         null=True,
     )
+
 
     latitude = models.DecimalField(
         max_digits=9,
@@ -702,6 +709,10 @@ class EvidenceAttachment(models.Model):
         blank=True,
         null=True,
     )
+
+    # =========================================================
+    # STATUS
+    # =========================================================
 
     is_verified = models.BooleanField(
         default=False,
@@ -734,13 +745,8 @@ class EvidenceAttachment(models.Model):
     def clean(self):
         super().clean()
 
-        if not self.file:
-            return
-
-        # File size limits:
-        #
-        # Photo/document/audio -> 20 MB
-        # Video                -> 50 MB
+        # File size limits are checked against
+        # the ORIGINAL uploaded file.
 
         max_size = (
             50 * 1024 * 1024
@@ -748,25 +754,14 @@ class EvidenceAttachment(models.Model):
             else 20 * 1024 * 1024
         )
 
-        if self.file.size > max_size:
+        if self.original_file_size > max_size:
             raise ValidationError(
                 {
-                    "file":
+                    "file_size":
                     f"File size cannot exceed "
                     f"{max_size // (1024 * 1024)} MB."
                 }
             )
-
-    def save(self, *args, **kwargs):
-        if self.file:
-            self.file_size = self.file.size
-
-            if not self.file_name:
-                self.file_name = self.file.name
-
-        self.full_clean()
-
-        super().save(*args, **kwargs)
 
     @property
     def file_size_mb(self):
@@ -775,9 +770,15 @@ class EvidenceAttachment(models.Model):
             2
         )
 
+    @property
+    def original_file_size_mb(self):
+        return round(
+            self.original_file_size / (1024 * 1024),
+            2
+        )
+
     def __str__(self):
         return self.file_name or f"Evidence #{self.pk}"
-
 
 # ============================================================
 # VERIFICATION RECORD

@@ -18,6 +18,7 @@ class IncidentCategorySerializer(serializers.ModelSerializer):
 
     class Meta:
         model = IncidentCategory
+
         fields = [
             "id",
             "name",
@@ -38,6 +39,7 @@ class DamageTypeSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = DamageType
+
         fields = [
             "id",
             "name",
@@ -56,31 +58,63 @@ class EvidenceAttachmentSerializer(serializers.ModelSerializer):
 
         fields = [
             "id",
-            "file",
+
+            # File information
             "file_name",
+            "original_file_name",
+            "file_path",
+            "file_url",
+
+            # Size
             "file_size",
+            "original_file_size",
+
+            # Type
             "file_type",
             "mime_type",
+
+            # Thumbnail
+            "thumbnail_path",
+            "thumbnail_url",
+
+            # Description
             "description",
             "description_bn",
+
+            # Location
             "latitude",
             "longitude",
+
+            # Status
             "is_verified",
             "is_public",
+
+            # Time
             "uploaded_at",
+            "updated_at",
         ]
 
         read_only_fields = [
             "id",
             "file_name",
+            "original_file_name",
+            "file_path",
+            "file_url",
             "file_size",
+            "original_file_size",
+            "file_type",
+            "mime_type",
+            "thumbnail_path",
+            "thumbnail_url",
             "is_verified",
             "uploaded_at",
+            "updated_at",
         ]
 
 
-
+# ============================================================
 # INCIDENT REPORT CREATE SERIALIZER
+# ============================================================
 
 class IncidentReportCreateSerializer(serializers.ModelSerializer):
 
@@ -160,7 +194,10 @@ class IncidentReportCreateSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
+    # ========================================================
     # VALIDATION
+    # ========================================================
+
     def validate(self, attrs):
 
         # -----------------------------------------
@@ -171,43 +208,34 @@ class IncidentReportCreateSerializer(serializers.ModelSerializer):
         longitude = attrs.get("longitude")
 
         if (latitude is None) != (longitude is None):
+
             raise serializers.ValidationError({
                 "location": (
-                    "Latitude and longitude must be provided together."
+                    "Latitude and longitude must be "
+                    "provided together."
                 )
             })
 
-
+        # -----------------------------------------
         # Future incident time
+        # -----------------------------------------
 
         incident_time = attrs.get("incident_time")
 
         if incident_time and incident_time > timezone.now():
+
             raise serializers.ValidationError({
                 "incident_time": (
                     "Incident time cannot be in the future."
                 )
             })
 
-        # Anonymous reporter validation
-
-        is_anonymous = attrs.get(
-            "is_anonymous",
-            False
-        )
-
-        reporter_name = attrs.get("reporter_name")
-        reporter_phone = attrs.get("reporter_phone")
-
-        if is_anonymous:
-            # For anonymous reports, reporter account
-            # is not required.
-            pass
-
         return attrs
 
-
+    # ========================================================
     # CREATE
+    # ========================================================
+
     @transaction.atomic
     def create(self, validated_data):
 
@@ -218,37 +246,52 @@ class IncidentReportCreateSerializer(serializers.ModelSerializer):
 
         request = self.context.get("request")
 
-
+        # -----------------------------------------
         # Reporter
+        # -----------------------------------------
 
         reporter = None
 
         if request and request.user.is_authenticated:
             reporter = request.user
 
+        # -----------------------------------------
         # Category
+        # -----------------------------------------
+
         category = validated_data["category"]
 
-
+        # -----------------------------------------
         # Generate title
+        # -----------------------------------------
+
         district = validated_data.get("district")
         upazila = validated_data.get("upazila")
 
         location = upazila or district
 
         if location:
+
             title = (
                 f"{category.name} Incident - {location}"
             )
-        else:
-            title = f"{category.name} Incident"
 
+        else:
+
+            title = (
+                f"{category.name} Incident"
+            )
+
+        # -----------------------------------------
         # Anonymous report
+        # -----------------------------------------
 
         if validated_data.get("is_anonymous", False):
             reporter = None
 
+        # -----------------------------------------
         # Create incident
+        # -----------------------------------------
 
         incident = IncidentReport.objects.create(
             reporter=reporter,
@@ -257,16 +300,22 @@ class IncidentReportCreateSerializer(serializers.ModelSerializer):
             **validated_data
         )
 
+        # -----------------------------------------
         # Damage types
+        # -----------------------------------------
 
         if damage_types:
+
             incident.damage_types.set(
                 damage_types
             )
 
         return incident
 
+
+# ============================================================
 # INCIDENT REPORT DETAIL SERIALIZER
+# ============================================================
 
 class IncidentReportDetailSerializer(serializers.ModelSerializer):
 
@@ -347,6 +396,7 @@ class IncidentReportDetailSerializer(serializers.ModelSerializer):
             return "Anonymous"
 
         if obj.reporter:
+
             return getattr(
                 obj.reporter,
                 "full_name",

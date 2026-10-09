@@ -7,7 +7,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from alert_notifications.models import Alert, NotificationLog
+from alert_notifications.models import Alert
 from incidents.models import (
     IncidentReport,
     Shelter,
@@ -17,6 +17,11 @@ from incidents.models import (
 )
 from users.models import AdministrativeArea, DisasterManagementOfficerProfile
 from users.permissions import isDisasterManagementOfficer
+from dashboard.notification_service import (
+    list_notifications,
+    mark_all_read,
+    unread_count,
+)
 
 from dashboard.views import (
     SEVERITY_RANK,
@@ -66,11 +71,6 @@ ALERT_TYPE_TO_FE = {
     "cyclone": "cyclone", "storm_surge": "surge", "flood": "flood",
     "erosion": "erosion", "general": "flood", "emergency": "surge",
     "preparedness": "cyclone", "evacuation": "surge",
-}
-NOTIF_KIND = {
-    "alert": "alert", "critical_alert": "alert",
-    "report_submission": "report", "report_update": "report",
-    "assignment": "mission", "reminder": "system", "broadcast": "system",
 }
 MAP_DISTRICTS = [
     {"name": "সাতক্ষীরা", "x": 86, "y": 398},
@@ -390,9 +390,7 @@ class OfficerBadgeView(APIView):
             .distinct()
             .count()
         )
-        unread = NotificationLog.objects.filter(
-            recipient=request.user, read_at__isnull=True
-        ).count()
+        unread = unread_count(request.user)
         critical = sum(
             1 for a in alerts
             if (a.severity or "").lower() in ("critical", "high")
@@ -501,40 +499,15 @@ class OfficerNotificationsView(APIView):
     permission_classes = OFFICER_PERMS
 
     def get(self, request):
-        rows = NotificationLog.objects.filter(recipient=request.user).order_by("-created_at")[:80]
-        data = []
-        for n in rows:
-            data.append({
-                "id": n.id,
-                "kind": NOTIF_KIND.get(n.notification_type, "system"),
-                "title": n.subject,
-                "body": n.body_bn or n.body or "",
-                "time": ms(n.created_at),
-                "read": n.read_at is not None,
-            })
-        return Response(data)
+        return Response(list_notifications(request.user))
 
 
 class OfficerNotificationReadAllView(APIView):
     permission_classes = OFFICER_PERMS
 
     def post(self, request):
-        now = timezone.now()
-        NotificationLog.objects.filter(
-            recipient=request.user, read_at__isnull=True
-        ).update(read_at=now, status="read")
-        rows = NotificationLog.objects.filter(recipient=request.user).order_by("-created_at")[:80]
-        return Response([
-            {
-                "id": n.id,
-                "kind": NOTIF_KIND.get(n.notification_type, "system"),
-                "title": n.subject,
-                "body": n.body_bn or n.body or "",
-                "time": ms(n.created_at),
-                "read": True,
-            }
-            for n in rows
-        ])
+        mark_all_read(request.user)
+        return Response(list_notifications(request.user))
 
 
 # ============================================================
