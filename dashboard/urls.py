@@ -44,6 +44,10 @@ from .volunteer_views import (
     VolunteerSectionView,
     VolunteerAvailabilityView,
     VolunteerCompleteTaskView,
+    VolunteerUpdateTaskView,
+    VolunteerOperationsView,
+    VolunteerJoinOperationView,
+    VolunteerActivitiesView,
 )
 from .citizen_views import (
     CitizenOverviewView as CitizenOverviewV2,
@@ -111,7 +115,10 @@ urlpatterns = [
     path('volunteer/section/<str:key>/', VolunteerSectionView.as_view(), name='volunteer-section'),
     path('volunteer/availability/', VolunteerAvailabilityView.as_view(), name='volunteer-availability'),
     path('volunteer/tasks/<str:pk>/complete/', VolunteerCompleteTaskView.as_view(), name='volunteer-task-complete'),
-
+    path('volunteer/tasks/<str:pk>/update/', VolunteerUpdateTaskView.as_view(), name='volunteer-task-update'),
+    path('volunteer/operations/', VolunteerOperationsView.as_view(), name='volunteer-operations'),
+    path('volunteer/operations/<str:key>/join/', VolunteerJoinOperationView.as_view(), name='volunteer-operation-join'),
+    path('volunteer/activities/', VolunteerActivitiesView.as_view(), name='volunteer-activities'),
 
     path('notifications/', NotificationListView.as_view(), name='notifications'),
     path('notifications/summary/', NotificationSummaryView.as_view(), name='notifications-summary'),

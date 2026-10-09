@@ -10,10 +10,14 @@ GET  volunteer/reports/
 GET  volunteer/shelters/
 GET  volunteer/map/
 GET  volunteer/profile/
-GET  volunteer/section/<key>/   key = community-reports | assistance | my-area
+GET  volunteer/section/<key>/   key = community-reports | assistance | my-area | rescue-operations
 GET  volunteer/availability/
 POST volunteer/availability/    { "status": "AVAILABLE"|"UNAVAILABLE" }
-POST volunteer/tasks/<pk>/complete/
+POST volunteer/tasks/<pk>/complete/   optional body: note, people_helped
+POST volunteer/tasks/<pk>/update/     { status?, note?, people_helped?, detail? }
+GET  volunteer/operations/
+POST volunteer/operations/<key>/join/  { kind?: RELIEF|RESCUE, note? }
+GET  volunteer/activities/
 """
 
 from datetime import timedelta
@@ -24,7 +28,7 @@ from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from dashboard.models import ResponderAvailabilityLog
+from dashboard.models import ResponderAvailabilityLog, VolunteerActivity
 from dashboard.notification_service import unread_count
 from dashboard.officer_views import (
     MAP_DISTRICTS,
@@ -32,6 +36,7 @@ from dashboard.officer_views import (
     matching_alerts,
     ms,
     serialize_alert_card,
+    serialize_operations,
     serialize_report,
     serialize_shelter,
     scoped_shelters,
@@ -93,7 +98,7 @@ def volunteer_profile(user):
         p = (
             CommunityVolunteerProfile.objects
             .filter(user=user)
-            .prefetch_related("administrative_areas", "administrative_areas__parent")
+            .prefetch_related("administrative_area", "administrative_area__parent")
             .first()
         )
         if p:
@@ -200,18 +205,29 @@ def due_label(dt):
     return dt.strftime("%d/%m")
 
 
-def build_tasks(user, limit=20):
+def build_tasks(user, limit=30):
     """
-    Assistance tasks for the volunteer.
+    Assistance + relief/rescue activities for the volunteer.
 
-    Prefer ResponseAssignment linked to this user (via assigned_to.user or
-    assigned_to matching volunteer profile). Fallback: open area incidents
-    as community-assistance opportunities.
+    1) Persisted VolunteerActivity rows (joined ops, updated help logs)
+    2) ResponseAssignment linked to this user
+    3) Open area incidents as suggested assistance (if not already tracked)
     """
     incidents, profile, region, districts, upazilas = scoped_incidents(user)
     tasks = []
+    seen_incident = set()
+    seen_asg = set()
 
-    # Assignments where assigned responder/volunteer user matches
+    # 1) Own VolunteerActivity records
+    for act in VolunteerActivity.objects.filter(user=user).order_by("-updated_at")[:limit]:
+        row = act.to_task_dict()
+        tasks.append(row)
+        if act.incident_id:
+            seen_incident.add(act.incident_id)
+        if act.assignment_id:
+            seen_asg.add(act.assignment_id)
+
+    # 2) Assignments assigned to this user
     assign_qs = (
         ResponseAssignment.objects
         .select_related("incident", "incident__category", "assigned_to", "assigned_to__user")
@@ -219,18 +235,22 @@ def build_tasks(user, limit=20):
         .exclude(status__in=["declined", "cancelled"])
         .order_by("-created_at")
     )
-
     mine = []
     for a in assign_qs[:50]:
+        if a.id in seen_asg:
+            continue
         assignee_user = getattr(getattr(a, "assigned_to", None), "user", None)
         if assignee_user and assignee_user.id == user.id:
             mine.append(a)
         elif profile and getattr(a, "assigned_to_id", None) == getattr(profile, "id", None):
             mine.append(a)
 
-    for a in mine[:limit]:
+    for a in mine:
+        if len(tasks) >= limit:
+            break
         inc = a.incident
         status = ASSIGN_TO_TASK.get((a.status or "").lower(), "PENDING")
+        # Prefer VolunteerActivity status if later synced — already skipped via seen_asg
         title = (
             inc.title_bn or inc.title
             or (inc.category.name_bn if inc.category_id else f"সহায়তা #{inc.id}")
@@ -242,39 +262,36 @@ def build_tasks(user, limit=20):
             "due": due_label(a.assignment_time or a.created_at) if status != "DONE" else "সম্পন্ন",
             "status": status,
             "detail": (inc.description_bn or inc.description or "")[:160],
-            "_assignment_id": a.id,
-            "_incident_id": inc.id,
+            "note": "",
+            "kind": "ASSISTANCE",
+            "peopleHelped": 0,
+            "incidentId": inc.id,
         })
+        seen_incident.add(inc.id)
+        seen_asg.add(a.id)
 
-    if tasks:
-        return tasks
-
-    # Fallback: area open incidents as suggested assistance work
+    # 3) Suggested open incidents not yet tracked
     open_qs = (
         incidents
         .filter(status__in=OPEN_STATUSES)
         .order_by("-created_at")[:limit]
     )
     for inc in open_qs:
-        # completed marker via ResponseAction by this user
+        if len(tasks) >= limit:
+            break
+        if inc.id in seen_incident:
+            continue
         done = ResponseAction.objects.filter(
             assignment__incident=inc,
-            performed_by=user,
-            action_type__in=["assistance", "relief", "community", "other"],
-        ).exists() if hasattr(ResponseAction, "performed_by") else False
-
-        # also check note-based completion
-        if not done:
-            done = ResponseAction.objects.filter(
-                assignment__incident=inc,
-                notes__icontains=f"volunteer:{user.id}:done",
-            ).exists()
-
+            notes__icontains=f"volunteer:{user.id}:done",
+        ).exists()
+        # Also covered if VA exists — already in seen_incident
         status = "DONE" if done else ("ONGOING" if inc.status == "in_progress" else "PENDING")
         title = (
             inc.title_bn or inc.title
             or (inc.category.name_bn if inc.category_id else f"সহায়তা #{inc.id}")
         )
+        people = inc.affected_people_estimate or 0
         tasks.append({
             "id": f"INC-{inc.id}",
             "title": title,
@@ -282,10 +299,143 @@ def build_tasks(user, limit=20):
             "due": BN_DUE.get(status, "শীঘ্রই"),
             "status": status,
             "detail": (inc.description_bn or inc.description or "")[:160],
-            "_incident_id": inc.id,
+            "note": "",
+            "kind": "ASSISTANCE",
+            "peopleHelped": 0,
+            "suggestedPeople": people,
+            "incidentId": inc.id,
         })
 
     return tasks
+
+
+def build_operations_for_volunteer(user):
+    """Area rescue/relief operations with join state for this volunteer."""
+    incidents, *_ = scoped_incidents(user)
+    ops = serialize_operations(incidents)
+    joined_keys = set(
+        VolunteerActivity.objects.filter(
+            user=user,
+            operation_key__gt="",
+        ).exclude(status="DONE").values_list("operation_key", flat=True)
+    )
+    joined_done = set(
+        VolunteerActivity.objects.filter(
+            user=user,
+            operation_key__gt="",
+            status="DONE",
+        ).values_list("operation_key", flat=True)
+    )
+    out = []
+    for o in ops:
+        key = str(o.get("id") or "")
+        row = {**o, "canJoin": True, "joined": key in joined_keys, "completed": key in joined_done}
+        if row["joined"]:
+            row["joinLabel"] = "অংশগ্রহণরত"
+        elif row["completed"]:
+            row["joinLabel"] = "সম্পন্ন"
+        else:
+            row["joinLabel"] = "অংশ নিন"
+        out.append(row)
+    return out
+
+
+def ensure_activity_from_task_id(user, pk, defaults=None):
+    """
+    Resolve task id (VA-1 | ASG-2 | INC-3) to a VolunteerActivity, creating if needed.
+    Returns (activity, error_response).
+    """
+    defaults = defaults or {}
+    raw = str(pk)
+
+    if raw.upper().startswith("VA-"):
+        try:
+            act_id = int(raw.split("-", 1)[1])
+        except ValueError:
+            return None, Response({"detail": "Invalid task id"}, status=400)
+        act = VolunteerActivity.objects.filter(pk=act_id, user=user).first()
+        if not act:
+            return None, Response({"detail": "Activity not found"}, status=404)
+        return act, None
+
+    assignment_id = None
+    incident_id = None
+    if raw.upper().startswith("ASG-"):
+        try:
+            assignment_id = int(raw.split("-", 1)[1])
+        except ValueError:
+            return None, Response({"detail": "Invalid task id"}, status=400)
+    elif raw.upper().startswith("INC-"):
+        try:
+            incident_id = int(raw.split("-", 1)[1])
+        except ValueError:
+            return None, Response({"detail": "Invalid task id"}, status=400)
+    else:
+        try:
+            n = int(raw)
+        except ValueError:
+            return None, Response({"detail": "Invalid task id"}, status=400)
+        if ResponseAssignment.objects.filter(pk=n).exists():
+            assignment_id = n
+        else:
+            incident_id = n
+
+    # Existing activity?
+    q = VolunteerActivity.objects.filter(user=user)
+    if assignment_id:
+        act = q.filter(assignment_id=assignment_id).first()
+        if act:
+            return act, None
+        try:
+            asg = ResponseAssignment.objects.select_related("incident", "incident__category").get(pk=assignment_id)
+        except ResponseAssignment.DoesNotExist:
+            return None, Response({"detail": "Task not found"}, status=404)
+        inc = asg.incident
+        title = (
+            inc.title_bn or inc.title
+            or (inc.category.name_bn if inc.category_id else f"সহায়তা #{inc.id}")
+        )
+        act = VolunteerActivity.objects.create(
+            user=user,
+            title=title,
+            place=place_of(inc),
+            detail=(inc.description_bn or inc.description or "")[:500],
+            kind=defaults.get("kind", VolunteerActivity.Kind.ASSISTANCE),
+            status=defaults.get("status", VolunteerActivity.Status.ONGOING),
+            incident_id=inc.id,
+            assignment_id=asg.id,
+            people_helped=defaults.get("people_helped", 0),
+            note=defaults.get("note", ""),
+        )
+        return act, None
+
+    # Incident
+    incidents, *_ = scoped_incidents(user)
+    try:
+        inc = incidents.get(pk=incident_id)
+    except IncidentReport.DoesNotExist:
+        return None, Response({"detail": "Task not found in your area"}, status=404)
+
+    act = q.filter(incident_id=inc.id, operation_key="").first()
+    if act:
+        return act, None
+
+    title = (
+        inc.title_bn or inc.title
+        or (inc.category.name_bn if inc.category_id else f"সহায়তা #{inc.id}")
+    )
+    act = VolunteerActivity.objects.create(
+        user=user,
+        title=title,
+        place=place_of(inc),
+        detail=(inc.description_bn or inc.description or "")[:500],
+        kind=defaults.get("kind", VolunteerActivity.Kind.ASSISTANCE),
+        status=defaults.get("status", VolunteerActivity.Status.ONGOING),
+        incident_id=inc.id,
+        people_helped=defaults.get("people_helped", 0),
+        note=defaults.get("note", ""),
+    )
+    return act, None
 
 
 def affected_people_sum(incidents):
@@ -354,6 +504,12 @@ class VolunteerOverviewView(APIView):
         tasks = build_tasks(user)
         open_tasks = sum(1 for t in tasks if t["status"] != "DONE")
         people = affected_people_sum(incidents)
+        helped = (
+            VolunteerActivity.objects.filter(user=user).aggregate(s=Sum("people_helped"))["s"]
+            or 0
+        )
+        # Prefer logged help; fall back to area estimate
+        people_display = helped if helped else people
 
         today = now.replace(hour=0, minute=0, second=0, microsecond=0)
         new_today = incidents.filter(created_at__gte=today).count()
@@ -411,9 +567,9 @@ class VolunteerOverviewView(APIView):
             },
             {
                 "key": "people",
-                "label": "সহায়তাপ্রয়োজন মানুষ",
-                "value": people,
-                "hint": "নিবন্ধিত তালিকা অনুযায়ী",
+                "label": "সহায়তাপ্রাপ্ত / প্রয়োজন",
+                "value": people_display,
+                "hint": "আপনার লগ ও এলাকার অনুমান",
                 "tone": "emerald",
                 "icon": "HandHeart",
             },
@@ -532,17 +688,30 @@ class VolunteerProfileView(APIView):
         tasks = build_tasks(user, limit=50)
         done = sum(1 for t in tasks if t["status"] == "DONE")
         open_t = sum(1 for t in tasks if t["status"] != "DONE")
-        # assistance help count ≈ actions by user
-        help_count = ResponseAction.objects.filter(
-            notes__icontains=f"volunteer:{user.id}"
-        ).count()
+        people = (
+            VolunteerActivity.objects.filter(user=user).aggregate(s=Sum("people_helped"))["s"]
+            or 0
+        )
+        # Timeline from VolunteerActivity
+        acts = []
+        for a in VolunteerActivity.objects.filter(user=user).order_by("-updated_at")[:12]:
+            acts.append({
+                "id": f"va-{a.id}",
+                "kind": "mission" if a.kind in ("RESCUE", "RELIEF") else "report",
+                "title": a.title,
+                "place": a.place or "",
+                "body": a.note or a.detail or "",
+                "time": a.updated_at,
+            })
+        if not acts:
+            acts = build_activities(user, limit=12)
         return Response({
             "stats": [
                 {"label": "সম্পন্ন কার্যক্রম", "value": done, "tone": "emerald", "icon": "CircleCheck"},
                 {"label": "নির্ধারিত আছে", "value": open_t, "tone": "amber", "icon": "ClipboardList"},
-                {"label": "যাচাই সহায়তা", "value": help_count, "tone": "lagoon", "icon": "BadgeCheck"},
+                {"label": "সহায়তাপ্রাপ্ত মানুষ", "value": people, "tone": "lagoon", "icon": "HandHeart"},
             ],
-            "activities": build_activities(user, limit=12),
+            "activities": acts,
         })
 
 
@@ -558,6 +727,7 @@ class VolunteerSectionView(APIView):
             "community-reports": self.community_reports,
             "assistance": self.assistance,
             "my-area": self.my_area,
+            "rescue-operations": self.rescue_operations,
         }
         fn = builders.get(key)
         if not fn:
@@ -599,21 +769,50 @@ class VolunteerSectionView(APIView):
         tasks = build_tasks(user, limit=50)
         open_t = sum(1 for t in tasks if t["status"] != "DONE")
         ongoing = sum(1 for t in tasks if t["status"] == "ONGOING")
-        # this month completed
         month_start = timezone.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        done_month = ResponseAction.objects.filter(
-            notes__icontains=f"volunteer:{user.id}:done",
-            created_at__gte=month_start,
+        done_month = VolunteerActivity.objects.filter(
+            user=user, status="DONE", updated_at__gte=month_start
         ).count()
-        done_month = max(done_month, sum(1 for t in tasks if t["status"] == "DONE"))
+        people = (
+            VolunteerActivity.objects.filter(user=user).aggregate(s=Sum("people_helped"))["s"]
+            or 0
+        )
         return {
             "stats": [
                 {"label": "নির্ধারিত কার্যক্রম", "value": open_t, "tone": "lagoon", "icon": "ListChecks"},
                 {"label": "চলমান", "value": ongoing, "tone": "amber", "icon": "Activity"},
                 {"label": "এ মাসে সম্পন্ন", "value": done_month, "tone": "emerald", "icon": "CircleCheck"},
+                {"label": "সহায়তাপ্রাপ্ত", "value": people, "tone": "sky", "icon": "HandHeart"},
             ],
             "blocks": [
-                {"type": "taskCards", "title": "সহায়তা কার্যক্রম", "items": tasks},
+                {
+                    "type": "taskCards",
+                    "title": "সহায়তা ও ত্রাণ কার্যক্রম",
+                    "subtitle": "স্ট্যাটাস, নোট ও সহায়তাপ্রাপ্ত মানুষ আপডেট করুন",
+                    "items": tasks,
+                    "editable": True,
+                },
+            ],
+        }
+
+    def rescue_operations(self, user):
+        ops = build_operations_for_volunteer(user)
+        running = [o for o in ops if o.get("status") == "IN_PROGRESS"]
+        joined = sum(1 for o in ops if o.get("joined"))
+        rescued = sum(o.get("rescued") or 0 for o in ops)
+        return {
+            "stats": [
+                {"label": "চলমান অভিযান", "value": len(running), "tone": "red", "icon": "LifeBuoy"},
+                {"label": "আমার অংশগ্রহণ", "value": joined, "tone": "sky", "icon": "Users"},
+                {"label": "উদ্ধারকৃত (এলাকা)", "value": rescued, "tone": "emerald", "icon": "HandHeart"},
+            ],
+            "blocks": [
+                {
+                    "type": "volunteerOps",
+                    "title": "উদ্ধার ও ত্রাণ অভিযান",
+                    "subtitle": "এলাকার চলমান অভিযানে অংশ নিন",
+                    "items": ops,
+                },
             ],
         }
 
@@ -733,95 +932,228 @@ class VolunteerAvailabilityView(APIView):
 
 
 # ============================================================
-# COMPLETE TASK
+# TASK COMPLETE / UPDATE  (points 3 & 5)
 # ============================================================
 
 class VolunteerCompleteTaskView(APIView):
+    """Mark assistance/relief activity DONE. Body: note?, people_helped?"""
     permission_classes = PERMS
 
     def post(self, request, pk):
-        """
-        pk may be assignment id (ASG-123 → 123) or incident id (INC-45 → 45)
-        or plain integer.
-        """
         user = request.user
-        raw = str(pk)
-        assignment_id = None
-        incident_id = None
-
-        if raw.upper().startswith("ASG-"):
-            try:
-                assignment_id = int(raw.split("-", 1)[1])
-            except ValueError:
-                return Response({"detail": "Invalid task id"}, status=400)
-        elif raw.upper().startswith("INC-"):
-            try:
-                incident_id = int(raw.split("-", 1)[1])
-            except ValueError:
-                return Response({"detail": "Invalid task id"}, status=400)
-        else:
-            try:
-                n = int(raw)
-            except ValueError:
-                return Response({"detail": "Invalid task id"}, status=400)
-            # Prefer assignment
-            if ResponseAssignment.objects.filter(pk=n).exists():
-                assignment_id = n
-            else:
-                incident_id = n
-
-        if assignment_id:
-            try:
-                assignment = ResponseAssignment.objects.select_related("incident").get(pk=assignment_id)
-            except ResponseAssignment.DoesNotExist:
-                return Response({"detail": "Task not found"}, status=404)
-            assignment.status = "completed"
-            assignment.save(update_fields=["status", "updated_at"] if hasattr(assignment, "updated_at") else ["status"])
-            ResponseAction.objects.create(
-                assignment=assignment,
-                action_type="assistance",
-                notes=f"volunteer:{user.id}:done",
-                personnel_count=1,
-            )
-            return Response({"id": f"ASG-{assignment_id}", "status": "DONE"})
-
-        # Incident-based task
-        incidents, *_ = scoped_incidents(user)
+        note = (request.data.get("note") or "").strip()
+        people = request.data.get("people_helped")
         try:
-            incident = incidents.get(pk=incident_id)
-        except IncidentReport.DoesNotExist:
-            return Response({"detail": "Task not found in your area"}, status=404)
+            people = int(people) if people is not None and people != "" else None
+        except (TypeError, ValueError):
+            people = None
 
-        # Ensure an assignment exists to hang the action on
-        assignment = (
-            ResponseAssignment.objects
-            .filter(incident=incident)
-            .exclude(status__in=["declined", "cancelled"])
-            .order_by("-created_at")
-            .first()
-        )
-        if not assignment:
-            # Create a lightweight assignment if schema allows null assigned_to
+        defaults = {"status": VolunteerActivity.Status.DONE}
+        if note:
+            defaults["note"] = note
+        if people is not None:
+            defaults["people_helped"] = max(0, people)
+
+        act, err = ensure_activity_from_task_id(user, pk, defaults={
+            "status": VolunteerActivity.Status.DONE,
+            "note": note,
+            "people_helped": people or 0,
+        })
+        if err:
+            return err
+
+        act.status = VolunteerActivity.Status.DONE
+        if note:
+            act.note = note
+        if people is not None:
+            act.people_helped = max(0, people)
+        act.due_label = "সম্পন্ন"
+        act.save()
+
+        # Mirror onto ResponseAssignment when linked
+        if act.assignment_id:
             try:
-                assignment = ResponseAssignment.objects.create(
-                    incident=incident,
-                    status="completed",
-                )
-            except Exception:
-                assignment = None
-
-        if assignment:
-            ResponseAction.objects.create(
-                assignment=assignment,
-                action_type="assistance",
-                notes=f"volunteer:{user.id}:done",
-                personnel_count=1,
-            )
-            if assignment.status != "completed":
-                assignment.status = "completed"
+                asg = ResponseAssignment.objects.get(pk=act.assignment_id)
+                asg.status = "completed"
                 try:
-                    assignment.save(update_fields=["status", "updated_at"])
+                    asg.save(update_fields=["status", "updated_at"])
                 except Exception:
-                    assignment.save(update_fields=["status"])
+                    asg.save(update_fields=["status"])
+                ResponseAction.objects.create(
+                    assignment=asg,
+                    action_type="assistance",
+                    notes=f"volunteer:{user.id}:done|{act.note}",
+                    personnel_count=max(1, act.people_helped or 1),
+                )
+            except ResponseAssignment.DoesNotExist:
+                pass
+        elif act.incident_id:
+            asg = (
+                ResponseAssignment.objects
+                .filter(incident_id=act.incident_id)
+                .exclude(status__in=["declined", "cancelled"])
+                .order_by("-created_at")
+                .first()
+            )
+            if asg:
+                ResponseAction.objects.create(
+                    assignment=asg,
+                    action_type="assistance",
+                    notes=f"volunteer:{user.id}:done|{act.note}",
+                    personnel_count=max(1, act.people_helped or 1),
+                )
 
-        return Response({"id": f"INC-{incident_id}", "status": "DONE"})
+        return Response(act.to_task_dict())
+
+
+class VolunteerUpdateTaskView(APIView):
+    """
+    Update volunteer activity — status, note, people_helped, detail.
+    Point 3 + 5: help logging & activity updates.
+    """
+    permission_classes = PERMS
+
+    def post(self, request, pk):
+        user = request.user
+        status = (request.data.get("status") or "").upper()
+        note = request.data.get("note")
+        detail = request.data.get("detail")
+        people = request.data.get("people_helped")
+
+        try:
+            people = int(people) if people is not None and people != "" else None
+        except (TypeError, ValueError):
+            return Response({"detail": "people_helped must be a number"}, status=400)
+
+        allowed = {"PENDING", "ONGOING", "DONE"}
+        if status and status not in allowed:
+            return Response({"detail": "Invalid status"}, status=400)
+
+        start_status = status if status in allowed else VolunteerActivity.Status.ONGOING
+        act, err = ensure_activity_from_task_id(user, pk, defaults={
+            "status": start_status,
+            "note": (note or "").strip() if note is not None else "",
+            "people_helped": people if people is not None else 0,
+        })
+        if err:
+            return err
+
+        if status in allowed:
+            act.status = status
+            if status == "DONE":
+                act.due_label = "সম্পন্ন"
+            elif status == "ONGOING":
+                act.due_label = "চলমান"
+        if note is not None:
+            act.note = str(note).strip()
+        if detail is not None:
+            act.detail = str(detail).strip()[:500]
+        if people is not None:
+            act.people_helped = max(0, people)
+        act.save()
+
+        if act.status == "DONE" and act.assignment_id:
+            try:
+                asg = ResponseAssignment.objects.get(pk=act.assignment_id)
+                asg.status = "completed"
+                try:
+                    asg.save(update_fields=["status", "updated_at"])
+                except Exception:
+                    asg.save(update_fields=["status"])
+            except ResponseAssignment.DoesNotExist:
+                pass
+
+        return Response(act.to_task_dict())
+
+
+# ============================================================
+# RESCUE / RELIEF JOIN  (point 4)
+# ============================================================
+
+class VolunteerOperationsView(APIView):
+    permission_classes = PERMS
+
+    def get(self, request):
+        return Response(build_operations_for_volunteer(request.user))
+
+
+class VolunteerJoinOperationView(APIView):
+    """
+    Join an area rescue/relief operation.
+    key = operation id e.g. OP-12
+    body: { kind?: "RELIEF"|"RESCUE", note? }
+    """
+    permission_classes = PERMS
+
+    def post(self, request, key):
+        user = request.user
+        op_key = str(key)
+        kind = (request.data.get("kind") or "RELIEF").upper()
+        if kind not in ("RELIEF", "RESCUE", "ASSISTANCE"):
+            kind = "RELIEF"
+        note = (request.data.get("note") or "").strip()
+
+        # Already joined & active?
+        existing = VolunteerActivity.objects.filter(
+            user=user, operation_key=op_key
+        ).exclude(status="DONE").first()
+        if existing:
+            return Response(existing.to_task_dict())
+
+        # Find operation from area list
+        ops = build_operations_for_volunteer(user)
+        op = next((o for o in ops if str(o.get("id")) == op_key), None)
+        if not op:
+            return Response({"detail": "Operation not found in your area"}, status=404)
+
+        # Extract incident id from OP-{id}
+        incident_id = None
+        if op_key.upper().startswith("OP-"):
+            try:
+                incident_id = int(op_key.split("-", 1)[1])
+            except ValueError:
+                incident_id = None
+
+        act = VolunteerActivity.objects.create(
+            user=user,
+            title=op.get("title") or f"অভিযান {op_key}",
+            place=op.get("district") or "",
+            detail=f"নেতৃত্বে: {op.get('lead') or '—'} • দল: {op.get('teams') or 0}",
+            note=note,
+            kind=kind,
+            status=VolunteerActivity.Status.ONGOING,
+            operation_key=op_key,
+            incident_id=incident_id,
+            due_label="চলমান",
+            people_helped=0,
+        )
+        return Response(act.to_task_dict(), status=201)
+
+
+# ============================================================
+# ACTIVITY HISTORY  (point 5)
+# ============================================================
+
+class VolunteerActivitiesView(APIView):
+    permission_classes = PERMS
+
+    def get(self, request):
+        user = request.user
+        qs = VolunteerActivity.objects.filter(user=user)
+        status = (request.query_params.get("status") or "").upper()
+        kind = (request.query_params.get("kind") or "").upper()
+        if status in ("PENDING", "ONGOING", "DONE"):
+            qs = qs.filter(status=status)
+        if kind in ("ASSISTANCE", "RELIEF", "RESCUE", "OTHER"):
+            qs = qs.filter(kind=kind)
+        rows = [a.to_task_dict() for a in qs.order_by("-updated_at")[:100]]
+        people = qs.aggregate(s=Sum("people_helped"))["s"] or 0
+        return Response({
+            "items": rows,
+            "stats": {
+                "total": len(rows),
+                "done": sum(1 for r in rows if r["status"] == "DONE"),
+                "ongoing": sum(1 for r in rows if r["status"] == "ONGOING"),
+                "peopleHelped": people,
+            },
+        })
