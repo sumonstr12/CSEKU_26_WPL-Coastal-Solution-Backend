@@ -25,12 +25,16 @@ SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "media")
 DEBUG = os.getenv('DEBUG', 'False').lower() in ('1', 'true', 'yes', 'on')
 
 # ALLOWED_HOSTS = []
+
 ALLOWED_HOSTS = [
-    "https://cseku-26-wpl-coastal-solution-backend.onrender.com"
+    "localhost",
+    "127.0.0.1",
+    "cseku-26-wpl-coastal-solution-backend.onrender.com",
 ]
 
 CSRF_TRUSTED_ORIGINS = [
     "https://coastal-disaster-solution.vercel.app",
+    "https://cseku-26-wpl-coastal-solution-backend.onrender.com",
     "https://localhost",  # Capacitor Android
 ]
 
@@ -38,6 +42,8 @@ CORS_ALLOWED_ORIGINS = [
     "https://coastal-disaster-solution.vercel.app",
     "https://localhost",  # Capacitor Android
 ]
+
+CORS_ALLOW_CREDENTIALS = True
 
 SESSION_COOKIE_SAMESITE = "Lax"
 SESSION_COOKIE_SECURE = False
