@@ -16,12 +16,22 @@ from incidents.models import (
     VerificationRecord,
 )
 from users.models import AdministrativeArea, DisasterManagementOfficerProfile
-from users.permissions import isDisasterManagementOfficer
 from dashboard.notification_service import (
     list_notifications,
     mark_all_read,
     unread_count,
+    notify_users,
 )
+from dashboard.models import ReliefFundingRequest, RescueEvent
+from django.contrib.auth import get_user_model
+from rest_framework.permissions import BasePermission
+
+User = get_user_model()
+
+try:
+    from users.permissions import isDisasterManagementOfficer
+except ImportError:
+    isDisasterManagementOfficer = None
 
 from dashboard.views import (
     SEVERITY_RANK,
@@ -30,7 +40,26 @@ from dashboard.views import (
 )
 
 
-OFFICER_PERMS = [IsAuthenticated, isDisasterManagementOfficer]
+class IsDisasterOfficer(BasePermission):
+    def has_permission(self, request, view):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        if isDisasterManagementOfficer is not None:
+            try:
+                if bool(isDisasterManagementOfficer(user)):
+                    return True
+            except Exception:
+                pass
+        role = (getattr(user, "role", None) or "").upper()
+        return role in (
+            "DISASTER_MANAGEMENT_OFFICER",
+            "DISASTER_OFFICER",
+            "OFFICER",
+        )
+
+
+OFFICER_PERMS = [IsAuthenticated, IsDisasterOfficer]
 
 STATUS_TO_FE = {
     "submitted": "PENDING",
@@ -175,10 +204,20 @@ def scoped_incidents(user):
 
 def serialize_report(r):
     reporter_name = None
-    if not r.is_anonymous:
-        reporter_name = r.reporter_name or (
+    reporter_phone = None
+    if not getattr(r, "is_anonymous", False):
+        reporter_name = getattr(r, "reporter_name", None) or (
             r.reporter.full_name if r.reporter_id else None
         )
+        if r.reporter_id:
+            u = r.reporter
+            reporter_phone = (
+                getattr(u, "phone_number", None)
+                or getattr(u, "phone", None)
+                or getattr(u, "mobile", None)
+            )
+        if not reporter_phone:
+            reporter_phone = getattr(r, "reporter_phone", None) or getattr(r, "contact_phone", None)
     return {
         "id": r.id,
         "type": fe_report_type(r.category),
@@ -191,11 +230,14 @@ def serialize_report(r):
         "place": r.village or r.address or "",
         "severity": fe_severity(r),
         "status": fe_status(r),
+        "rawStatus": (r.status or "").lower(),
         "incident_time": r.incident_time,
         "time": r.incident_time or r.created_at,
         "affected": r.affected_people_estimate,
         "category": {"id": r.category_id} if r.category_id else {},
-        "reporter": {"name": reporter_name} if reporter_name else None,
+        "reporter": {"name": reporter_name, "phone": reporter_phone} if (reporter_name or reporter_phone) else None,
+        "reporterPhone": reporter_phone,
+        "isAnonymous": bool(getattr(r, "is_anonymous", False)),
     }
 
 
@@ -418,37 +460,585 @@ class OfficerReportsView(APIView):
 
 
 class OfficerVerifyReportView(APIView):
+    """
+    Change report verification status anytime (editable, not one-shot).
+
+    POST body:
+      { "action": "VERIFY"|"REJECT"|"PENDING"|"UNDER_REVIEW"|"RESOLVED" }
+      or { "status": "verified"|"rejected"|"submitted"|"under_review"|"resolved" }
+    """
     permission_classes = OFFICER_PERMS
+
+    ACTION_TO_STATUS = {
+        "VERIFY": "verified",
+        "VERIFIED": "verified",
+        "REJECT": "rejected",
+        "REJECTED": "rejected",
+        "PENDING": "submitted",
+        "SUBMITTED": "submitted",
+        "UNDER_REVIEW": "under_review",
+        "RESOLVED": "resolved",
+        "CLOSED": "closed",
+        "ASSIGNED": "assigned",
+        "IN_PROGRESS": "in_progress",
+    }
 
     def post(self, request, pk):
         action = (request.data.get("action") or "").upper()
+        status_raw = (request.data.get("status") or "").lower().strip()
+
         try:
-            incident = IncidentReport.objects.get(pk=pk)
+            incident = IncidentReport.objects.select_related("reporter", "category").get(pk=pk)
         except IncidentReport.DoesNotExist:
             return Response({"detail": "Report not found"}, status=404)
 
-        if action == "VERIFY":
-            incident.status = "verified"
-            incident.save(update_fields=["status", "updated_at"])
-            VerificationRecord.objects.create(
-                incident=incident,
-                verifier=request.user,
-                status="verified",
-                priority_assigned=incident.priority,
-                severity_assigned=incident.severity,
-            )
-        elif action == "REJECT":
-            incident.status = "rejected"
-            incident.save(update_fields=["status", "updated_at"])
-            VerificationRecord.objects.create(
-                incident=incident,
-                verifier=request.user,
-                status="rejected",
-            )
+        if status_raw:
+            new_status = status_raw
+        elif action in self.ACTION_TO_STATUS:
+            new_status = self.ACTION_TO_STATUS[action]
         else:
-            return Response({"detail": "Invalid action"}, status=400)
+            return Response(
+                {
+                    "detail": "Invalid action/status. Use VERIFY, REJECT, PENDING, UNDER_REVIEW, RESOLVED "
+                    "or status=verified|rejected|submitted|under_review|resolved"
+                },
+                status=400,
+            )
 
-        return Response({"id": incident.id, "action": action})
+        allowed = {
+            "submitted", "under_review", "verified", "rejected",
+            "assigned", "in_progress", "resolved", "closed", "duplicate",
+        }
+        if new_status not in allowed:
+            return Response({"detail": f"Unsupported status: {new_status}"}, status=400)
+
+        old = incident.status
+        incident.status = new_status
+        try:
+            incident.save(update_fields=["status", "updated_at"])
+        except Exception:
+            incident.save(update_fields=["status"])
+
+        # Log verification record for verify/reject transitions
+        vr_status = None
+        if new_status == "verified":
+            vr_status = "verified"
+        elif new_status == "rejected":
+            vr_status = "rejected"
+        if vr_status:
+            try:
+                VerificationRecord.objects.create(
+                    incident=incident,
+                    verifier=request.user,
+                    status=vr_status,
+                    priority_assigned=getattr(incident, "priority", None),
+                    severity_assigned=getattr(incident, "severity", None),
+                )
+            except Exception:
+                try:
+                    VerificationRecord.objects.create(
+                        incident=incident,
+                        verifier=request.user,
+                        status=vr_status,
+                    )
+                except Exception:
+                    pass
+
+        return Response({
+            "id": incident.id,
+            "action": action or new_status.upper(),
+            "status": fe_status(incident),
+            "rawStatus": new_status,
+            "previousStatus": old,
+            "message": f"স্ট্যাটাস আপডেট: {old} → {new_status}",
+        })
+
+
+def _officer_collect_evidence(incident, request=None):
+    items = []
+    seen = set()
+
+    def add(url, kind="file", name=None):
+        if not url or url in seen:
+            return
+        seen.add(url)
+        if request and str(url).startswith("/"):
+            url = request.build_absolute_uri(url)
+        lower = str(url).lower().split("?")[0]
+        if kind in ("file", "document", "photo"):
+            if kind == "photo" or any(lower.endswith(x) for x in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")):
+                kind = "image"
+            elif any(lower.endswith(x) for x in (".mp4", ".webm", ".mov", ".avi", ".mkv")):
+                kind = "video"
+        items.append({"url": url, "kind": kind, "name": name or str(url).rsplit("/", 1)[-1]})
+
+    try:
+        from incidents.models import EvidenceAttachment
+        for ev in EvidenceAttachment.objects.filter(incident=incident).order_by("id"):
+            url = getattr(ev, "file_url", None) or getattr(ev, "file_path", None)
+            kind = getattr(ev, "file_type", None) or "file"
+            name = getattr(ev, "original_file_name", None) or getattr(ev, "file_name", None)
+            add(url, kind=kind, name=name)
+    except Exception:
+        pass
+    return items
+
+
+class OfficerReportDetailView(APIView):
+    """GET officer/reports/<pk>/ — full detail + evidence + reporter contact."""
+    permission_classes = OFFICER_PERMS
+
+    def get(self, request, pk):
+        incidents, *_ = scoped_incidents(request.user)
+        incident = incidents.select_related("category", "reporter").filter(pk=pk).first()
+        if not incident:
+            incident = IncidentReport.objects.select_related("category", "reporter").filter(pk=pk).first()
+        if not incident:
+            return Response({"detail": f"রিপোর্ট #{pk} পাওয়া যায়নি"}, status=404)
+
+        base = serialize_report(incident)
+        lat = getattr(incident, "latitude", None) or getattr(incident, "lat", None)
+        lng = getattr(incident, "longitude", None) or getattr(incident, "lng", None)
+        base.update({
+            "address": getattr(incident, "address", None) or "",
+            "village": getattr(incident, "village", None) or "",
+            "union": getattr(incident, "union", None) or "",
+            "isSos": bool(getattr(incident, "is_sos", False)),
+            "situation": getattr(incident, "situation", None) or "",
+            "latitude": lat,
+            "longitude": lng,
+            "createdAt": getattr(incident, "created_at", None),
+            "updatedAt": getattr(incident, "updated_at", None),
+            "evidence": _officer_collect_evidence(incident, request=request),
+            "statusOptions": [
+                {"value": "PENDING", "label": "অপেক্ষমাণ (pending)"},
+                {"value": "UNDER_REVIEW", "label": "পর্যালোচনাধীন"},
+                {"value": "VERIFIED", "label": "যাচাইকৃত (সত্য)"},
+                {"value": "REJECTED", "label": "প্রত্যাখ্যাত (মিথ্যা)"},
+                {"value": "RESOLVED", "label": "সমাধানকৃত"},
+            ],
+        })
+        return Response(base)
+
+
+def _district_volunteers(district, exclude_user=None):
+    """Volunteers in same district (User.district only — no upazila on User)."""
+    qs = User.objects.filter(role__in=["COMMUNITY_VOLUNTEER", "VOLUNTEER"])
+    if exclude_user is not None:
+        qs = qs.exclude(pk=exclude_user.pk)
+    if district:
+        qs = qs.filter(district__icontains=district)
+    return list(qs[:80])
+
+
+class OfficerAnnounceEventView(APIView):
+    """
+    POST officer/reports/<pk>/announce/
+    Body: { mission_type: "RESCUE"|"RELIEF", note? }
+    Officer announces rescue or relief mission from VERIFIED incident.
+    Volunteers are notified and can join.
+    """
+    permission_classes = OFFICER_PERMS
+
+    def post(self, request, pk):
+        try:
+            incident = IncidentReport.objects.select_related("category").get(pk=pk)
+        except IncidentReport.DoesNotExist:
+            return Response({"detail": "Report not found"}, status=404)
+
+        status = (incident.status or "").lower()
+        if status not in ("verified", "assigned", "in_progress"):
+            return Response(
+                {
+                    "detail": "শুধু যাচাইকৃত (verified) রিপোর্ট থেকে ইভেন্ট ঘোষণা করা যায়। "
+                    f"বর্তমান অবস্থা: {incident.status}"
+                },
+                status=400,
+            )
+
+        mission_type = (request.data.get("mission_type") or request.data.get("kind") or "RESCUE").upper()
+        if mission_type not in ("RESCUE", "RELIEF"):
+            mission_type = "RESCUE"
+
+        kind_bn = "উদ্ধার" if mission_type == "RESCUE" else "ত্রাণ"
+        op_prefix = "OP" if mission_type == "RESCUE" else "REL"
+        op_key = f"{op_prefix}-{incident.id}"
+
+        existing = (
+            ResponseAssignment.objects
+            .filter(incident=incident)
+            .exclude(status__in=["declined", "cancelled", "completed"])
+            .first()
+        )
+        if existing:
+            return Response({
+                "id": incident.id,
+                "operation": {
+                    "id": op_key,
+                    "title": incident.title_bn or incident.title or f"{kind_bn} অভিযান #{incident.id}",
+                    "district": incident.district or "",
+                    "upazila": incident.upazila or "",
+                    "missionType": mission_type,
+                },
+                "notified": 0,
+                "message": "এই রিপোর্টের জন্য অভিযান ইতিমধ্যে চলমান।",
+                "alreadyExists": True,
+            })
+
+        asg = None
+        try:
+            asg = ResponseAssignment.objects.create(incident=incident, status="pending")
+        except Exception:
+            try:
+                asg = ResponseAssignment.objects.create(incident=incident)
+            except Exception:
+                asg = None
+
+        if status == "verified":
+            try:
+                incident.status = "assigned"
+                incident.save(update_fields=["status", "updated_at"])
+            except Exception:
+                pass
+
+        place = ", ".join(
+            p for p in [getattr(incident, "village", None), incident.upazila, incident.district] if p
+        ) or (getattr(incident, "address", None) or "")
+        title = incident.title_bn or incident.title or f"{kind_bn} অভিযান #{incident.id}"
+        officer_name = getattr(request.user, "full_name", None) or str(request.user)
+        note = (request.data.get("note") or "").strip()
+
+        subject = f"নতুন {kind_bn} ইভেন্ট — {place or incident.district or 'এলাকা'}"
+        body = (
+            f"কর্মকর্তা {officer_name} যাচাইকৃত রিপোর্ট থেকে {kind_bn} মিশন ঘোষণা করেছেন: {title}. "
+            f"লোকেশন: {place}. ড্যাশবোর্ড → উদ্ধার ও ত্রাণ থেকে অংশ নিতে পারেন।"
+        )
+        if note:
+            body += f" নোট: {note}"
+
+        peers = _district_volunteers(incident.district, exclude_user=request.user)
+        notified = 0
+        try:
+            notified = notify_users(
+                peers, subject=subject, body=body, body_bn=body, notification_type="assignment"
+            )
+        except Exception:
+            notified = 0
+
+        return Response({
+            "id": incident.id,
+            "action": "ANNOUNCE",
+            "status": incident.status,
+            "operation": {
+                "id": op_key,
+                "title": title,
+                "district": incident.district or "",
+                "upazila": incident.upazila or "",
+                "place": place,
+                "missionType": mission_type,
+                "assignmentId": asg.id if asg else None,
+            },
+            "notified": notified,
+            "message": f"{kind_bn} ইভেন্ট ঘোষণা হয়েছে। {notified} জন স্বেচ্ছাসেবককে জানানো হয়েছে।",
+        })
+
+
+class OfficerFundingListCreateView(APIView):
+    """
+    Location-based relief funding (manual, not per incident).
+
+    GET  officer/funding/
+    POST officer/funding/
+      {
+        incident_name, district, upazila?, village?, union?,
+        amount, description?, note?
+      }
+
+    Only ONE active request (PENDING/APPROVED/MODIFIED) per district+upazila.
+    """
+    permission_classes = OFFICER_PERMS
+
+    def get(self, request):
+        rows = [
+            r.to_dict()
+            for r in ReliefFundingRequest.objects.filter(requested_by=request.user)[:100]
+        ]
+        return Response(rows)
+
+    def post(self, request):
+        data = request.data
+        try:
+            amount = float(data.get("amount") or data.get("requested_amount") or 0)
+        except (TypeError, ValueError):
+            return Response({"detail": "amount অবৈধ"}, status=400)
+        if amount <= 0:
+            return Response({"detail": "amount ০ এর বেশি হতে হবে"}, status=400)
+
+        incident_name = (
+            data.get("incident_name")
+            or data.get("incidentName")
+            or data.get("title")
+            or ""
+        ).strip()
+        district = (data.get("district") or "").strip()
+        upazila = (data.get("upazila") or "").strip()
+        village = (data.get("village") or "").strip()
+        union_name = (data.get("union") or data.get("union_name") or "").strip()
+        description = (data.get("description") or "").strip()
+        note = (data.get("note") or data.get("officer_note") or "").strip()
+
+        if not incident_name:
+            return Response({"detail": "incident_name (দুর্যোগ/ঘটনার নাম) আবশ্যক"}, status=400)
+        if not district:
+            return Response({"detail": "district (জেলা) আবশ্যক"}, status=400)
+
+        # One active fund per location (district + upazila)
+        active = ReliefFundingRequest.objects.filter(
+            district__iexact=district,
+            upazila__iexact=upazila,
+            status__in=[
+                ReliefFundingRequest.Status.PENDING,
+                ReliefFundingRequest.Status.APPROVED,
+                ReliefFundingRequest.Status.MODIFIED,
+            ],
+        ).first()
+        if active:
+            return Response(
+                {
+                    "detail": (
+                        f"এই এলাকার ({upazila or '—'}, {district}) জন্য ইতিমধ্যে "
+                        f"একটি সক্রিয় তহবিল অনুরোধ আছে (#{active.id}, {active.status})। "
+                        "নতুন করে যোগ করা যাবে না।"
+                    ),
+                    "existing": active.to_dict(),
+                },
+                status=400,
+            )
+
+        row = ReliefFundingRequest.objects.create(
+            requested_by=request.user,
+            incident_name=incident_name,
+            district=district,
+            upazila=upazila,
+            village=village,
+            union_name=union_name,
+            description=description,
+            requested_amount=amount,
+            officer_note=note,
+            status=ReliefFundingRequest.Status.PENDING,
+        )
+
+        # Notify only Local Authority of THIS district (বাগেরহাট → Bagerhat authority)
+        try:
+            peers = _district_authorities(district, upazila)
+            loc = ", ".join(p for p in [village, upazila, district] if p)
+            notify_users(
+                peers,
+                subject=f"ত্রাণ তহবিল অনুরোধ — {incident_name}",
+                body=(
+                    f"{getattr(request.user, 'full_name', request.user)} "
+                    f"{amount:,.0f} টাকার ত্রাণ তহবিল চেয়েছেন। "
+                    f"ঘটনা: {incident_name}. এলাকা: {loc}. "
+                    f"ড্যাশবোর্ড → ত্রাণ তহবিল থেকে সিদ্ধান্ত নিন।"
+                ),
+                body_bn="",
+                notification_type="assignment",
+            )
+        except Exception:
+            pass
+
+        return Response(row.to_dict(), status=201)
+
+
+class OfficerFundingDetailView(APIView):
+    """
+    GET / PATCH / DELETE  officer/funding/<id>/
+
+    Officer CRUD on own relief funding requests.
+    - Update: mainly while PENDING
+    - Delete: PENDING or REJECTED
+    """
+    permission_classes = OFFICER_PERMS
+
+    def get_obj(self, request, pk):
+        try:
+            row = ReliefFundingRequest.objects.get(pk=pk)
+        except ReliefFundingRequest.DoesNotExist:
+            return None, Response({"detail": "তহবিল অনুরোধ পাওয়া যায়নি"}, status=404)
+        if row.requested_by_id != request.user.id and not request.user.is_superuser:
+            return None, Response({"detail": "এই অনুরোধ আপনার নয়"}, status=403)
+        return row, None
+
+    def get(self, request, pk):
+        row, err = self.get_obj(request, pk)
+        if err:
+            return err
+        return Response(row.to_dict())
+
+    def patch(self, request, pk):
+        row, err = self.get_obj(request, pk)
+        if err:
+            return err
+
+        # Editable while PENDING / REJECTED / MODIFIED (final APPROVED locked)
+        if row.status not in (
+            ReliefFundingRequest.Status.PENDING,
+            ReliefFundingRequest.Status.REJECTED,
+            ReliefFundingRequest.Status.MODIFIED,
+        ):
+            return Response(
+                {
+                    "detail": (
+                        f"চূড়ান্ত অনুমোদিত অনুরোধ ({row.status}) সম্পাদনা করা যায় না।"
+                    )
+                },
+                status=400,
+            )
+
+        data = request.data
+        if "incident_name" in data or "incidentName" in data or "title" in data:
+            name = (
+                data.get("incident_name")
+                or data.get("incidentName")
+                or data.get("title")
+                or ""
+            ).strip()
+            if name:
+                row.incident_name = name
+
+        new_district = row.district
+        new_upazila = row.upazila
+        if "district" in data and str(data.get("district") or "").strip():
+            new_district = str(data.get("district")).strip()
+        if "upazila" in data:
+            new_upazila = str(data.get("upazila") or "").strip()
+
+        # Location uniqueness (exclude self)
+        if new_district != row.district or new_upazila != row.upazila:
+            active = (
+                ReliefFundingRequest.objects.filter(
+                    district__iexact=new_district,
+                    upazila__iexact=new_upazila,
+                    status__in=[
+                        ReliefFundingRequest.Status.PENDING,
+                        ReliefFundingRequest.Status.APPROVED,
+                        ReliefFundingRequest.Status.MODIFIED,
+                    ],
+                )
+                .exclude(pk=row.pk)
+                .first()
+            )
+            if active:
+                return Response(
+                    {
+                        "detail": (
+                            f"এই এলাকায় ইতিমধ্যে সক্রিয় তহবিল আছে (#{active.id})।"
+                        )
+                    },
+                    status=400,
+                )
+            row.district = new_district
+            row.upazila = new_upazila
+
+        if "village" in data:
+            row.village = str(data.get("village") or "").strip()
+        if "union" in data or "union_name" in data:
+            row.union_name = str(data.get("union") or data.get("union_name") or "").strip()
+        if "description" in data:
+            row.description = str(data.get("description") or "").strip()
+        if "note" in data or "officer_note" in data:
+            row.officer_note = str(data.get("note") or data.get("officer_note") or "").strip()
+
+        if "amount" in data or "requested_amount" in data:
+            try:
+                amount = float(data.get("amount") or data.get("requested_amount") or 0)
+            except (TypeError, ValueError):
+                return Response({"detail": "amount অবৈধ"}, status=400)
+            if amount <= 0:
+                return Response({"detail": "amount ০ এর বেশি হতে হবে"}, status=400)
+            row.requested_amount = amount
+
+        # Re-open REJECTED / MODIFIED → PENDING after officer edit
+        if row.status in (
+            ReliefFundingRequest.Status.REJECTED,
+            ReliefFundingRequest.Status.MODIFIED,
+        ):
+            row.status = ReliefFundingRequest.Status.PENDING
+            row.authority_note = ""
+            row.approved_amount = None
+            row.decided_by = None
+            row.decided_at = None
+
+        row.save()
+        return Response(row.to_dict())
+
+    def delete(self, request, pk):
+        row, err = self.get_obj(request, pk)
+        if err:
+            return err
+        if row.status not in (
+            ReliefFundingRequest.Status.PENDING,
+            ReliefFundingRequest.Status.REJECTED,
+            ReliefFundingRequest.Status.MODIFIED,
+        ):
+            return Response(
+                {
+                    "detail": (
+                        f"{row.status} স্ট্যাটাসের অনুরোধ মুছা যায় না। "
+                        "শুধু অপেক্ষমাণ/প্রত্যাখ্যাত/সংশোধিত মুছা যাবে।"
+                    )
+                },
+                status=400,
+            )
+        rid = row.id
+        row.delete()
+        return Response({"detail": "তহবিল অনুরোধ মুছে ফেলা হয়েছে", "id": rid})
+
+
+def _district_authorities(district, upazila=None):
+    """Local Authority users for a district. বাগেরহাট request → বাগেরহাট authority only."""
+    roles = ["LOCAL_AUTHORITY", "AUTHORITY", "UNO", "UPAZILA_NIRBAHI"]
+    if not district:
+        return list(User.objects.filter(role__in=roles)[:40])
+
+    found = {}
+    for u in User.objects.filter(role__in=roles, district__iexact=district)[:40]:
+        found[u.pk] = u
+    if len(found) < 5:
+        for u in User.objects.filter(role__in=roles, district__icontains=district)[:40]:
+            found[u.pk] = u
+
+    try:
+        from users.models import LocalAuthorityProfile
+        pq = LocalAuthorityProfile.objects.filter(user__role__in=roles).select_related(
+            "user", "administrative_area", "administrative_area__parent"
+        )
+        for p in pq[:80]:
+            u = p.user
+            if u.pk in found:
+                continue
+            pd = (getattr(p, "district", None) or "").strip()
+            if pd and (pd == district or district in pd or pd in district):
+                found[u.pk] = u
+                continue
+            area = getattr(p, "administrative_area", None)
+            if not area:
+                continue
+            names = []
+            at = getattr(area, "area_type", None)
+            if at == "DISTRICT":
+                names.append(area.name)
+            elif at == "UPAZILA":
+                names.append(area.name)
+                parent = getattr(area, "parent", None)
+                if parent:
+                    names.append(parent.name)
+            if any(n and (district == n or district in n or n in district) for n in names):
+                found[u.pk] = u
+    except Exception:
+        pass
+
+    return list(found.values())[:40]
 
 
 # ============================================================
@@ -543,6 +1133,143 @@ class OfficerProfileView(APIView):
         })
 
 
+
+
+# ============================================================
+# LOCATION-BASED RESCUE / RELIEF EVENTS
+# ============================================================
+
+class OfficerEventListCreateView(APIView):
+    """
+    GET  officer/events/
+    POST officer/events/
+      { title, district, upazila?, mission_type: RESCUE|RELIEF, max_volunteers, note? }
+    """
+    permission_classes = OFFICER_PERMS
+
+    def get(self, request):
+        qs = RescueEvent.objects.select_related("created_by").order_by("-created_at")[:100]
+        return Response([e.to_dict() for e in qs])
+
+    def post(self, request):
+        data = request.data
+        title = (data.get("title") or "").strip()
+        district = (data.get("district") or "").strip()
+        upazila = (data.get("upazila") or "").strip()
+        note = (data.get("note") or "").strip()
+        mission_type = (data.get("mission_type") or data.get("kind") or "RESCUE").upper()
+        if mission_type not in ("RESCUE", "RELIEF"):
+            mission_type = "RESCUE"
+        try:
+            max_v = int(data.get("max_volunteers") or data.get("maxVolunteers") or 10)
+        except (TypeError, ValueError):
+            return Response({"detail": "max_volunteers অবৈধ"}, status=400)
+        if max_v < 1:
+            return Response({"detail": "max_volunteers কমপক্ষে ১"}, status=400)
+        if not title:
+            return Response({"detail": "title আবশ্যক"}, status=400)
+        if not district:
+            return Response({"detail": "district আবশ্যক"}, status=400)
+
+        ev = RescueEvent.objects.create(
+            title=title,
+            district=district,
+            upazila=upazila,
+            mission_type=mission_type,
+            max_volunteers=max_v,
+            note=note,
+            created_by=request.user,
+            status=RescueEvent.Status.OPEN,
+        )
+
+        # Notify district volunteers
+        try:
+            peers = _district_volunteers(district, exclude_user=request.user)
+            kind_bn = "উদ্ধার" if mission_type == "RESCUE" else "ত্রাণ"
+            notify_users(
+                peers,
+                subject=f"নতুন {kind_bn} ইভেন্ট — {upazila or district}",
+                body=(
+                    f"{getattr(request.user, 'full_name', request.user)} "
+                    f"{kind_bn} ইভেন্ট তৈরি করেছেন: {title}. "
+                    f"এলাকা: {upazila}, {district}. "
+                    f"সর্বোচ্চ {max_v} জন স্বেচ্ছাসেবক। ড্যাশবোর্ড → উদ্ধার ও ত্রাণ থেকে যোগ দিন।"
+                ),
+                body_bn="",
+                notification_type="assignment",
+            )
+        except Exception:
+            pass
+
+        return Response(ev.to_dict(), status=201)
+
+
+class OfficerEventDetailView(APIView):
+    """
+    PATCH officer/events/<pk>/   — edit title, location, max_volunteers, status, note
+    DELETE officer/events/<pk>/  — delete event
+    """
+    permission_classes = OFFICER_PERMS
+
+    def get_obj(self, pk):
+        try:
+            return RescueEvent.objects.get(pk=pk)
+        except RescueEvent.DoesNotExist:
+            return None
+
+    def patch(self, request, pk):
+        ev = self.get_obj(pk)
+        if not ev:
+            return Response({"detail": "ইভেন্ট পাওয়া যায়নি"}, status=404)
+        data = request.data
+        if "title" in data and str(data.get("title") or "").strip():
+            ev.title = str(data.get("title")).strip()
+        if "district" in data and str(data.get("district") or "").strip():
+            ev.district = str(data.get("district")).strip()
+        if "upazila" in data:
+            ev.upazila = str(data.get("upazila") or "").strip()
+        if "note" in data:
+            ev.note = str(data.get("note") or "").strip()
+        if "mission_type" in data or "kind" in data:
+            mt = (data.get("mission_type") or data.get("kind") or "").upper()
+            if mt in ("RESCUE", "RELIEF"):
+                ev.mission_type = mt
+        if "status" in data:
+            st = (data.get("status") or "").upper()
+            if st in ("OPEN", "CLOSED", "DONE"):
+                ev.status = st
+        if "max_volunteers" in data or "maxVolunteers" in data:
+            try:
+                mv = int(data.get("max_volunteers") or data.get("maxVolunteers"))
+                if mv < 1:
+                    return Response({"detail": "max_volunteers কমপক্ষে ১"}, status=400)
+                # cannot set below current joined
+                joined = ev.joined_total()
+                if mv < joined:
+                    return Response(
+                        {"detail": f"ইতিমধ্যে {joined} জন যোগ দিয়েছে — max_volunteers কম করা যাবে না"},
+                        status=400,
+                    )
+                ev.max_volunteers = mv
+            except (TypeError, ValueError):
+                return Response({"detail": "max_volunteers অবৈধ"}, status=400)
+        ev.save()
+        return Response(ev.to_dict())
+
+    def delete(self, request, pk):
+        ev = self.get_obj(pk)
+        if not ev:
+            return Response({"detail": "ইভেন্ট পাওয়া যায়নি"}, status=404)
+        # remove related volunteer activities for this op key
+        try:
+            from dashboard.models import VolunteerActivity
+            VolunteerActivity.objects.filter(operation_key=ev.operation_key).delete()
+        except Exception:
+            pass
+        ev.delete()
+        return Response({"detail": "ইভেন্ট মুছে ফেলা হয়েছে", "id": pk})
+
+
 # ============================================================
 # SECTION PAGES (monitoring / verification / ops / risk / areas)
 # ============================================================
@@ -557,6 +1284,7 @@ class OfficerSectionView(APIView):
             "rescue-operations": self.operations,
             "risk-analysis": self.risk_analysis,
             "areas": self.areas,
+            "funding": self.funding,
         }
         fn = builders.get(key)
         if not fn:
@@ -584,29 +1312,101 @@ class OfficerSectionView(APIView):
     def verification(self, user):
         incidents, *_ = scoped_incidents(user)
         pending_qs = incidents.filter(status__in=["submitted", "under_review"]).order_by("-created_at")
+        verified_qs = incidents.filter(status="verified").order_by("-updated_at")
         today = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
         today_verified = incidents.filter(status="verified", updated_at__gte=today).count()
+
+        def enrich(r):
+            row = serialize_report(r)
+            vcount = 0
+            try:
+                vcount = VerificationRecord.objects.filter(
+                    incident=r, status="verified"
+                ).count()
+            except Exception:
+                vcount = 1 if (r.status or "").lower() == "verified" else 0
+            row["isVerified"] = (r.status or "").lower() == "verified"
+            row["verificationCount"] = vcount
+            return row
+
+        # Area snapshot: recent incidents with verify status (upazila/district view)
+        area_items = [enrich(r) for r in incidents.order_by("-created_at")[:80]]
+        verified_items = [enrich(r) for r in verified_qs[:40]]
+
         return {
             "stats": [
                 {"label": "যাচাই অপেক্ষিত", "value": pending_qs.count(), "tone": "amber", "icon": "BadgeCheck"},
-                {"label": "আজ যাচাইকৃত", "value": today_verified, "tone": "emerald", "icon": "CircleCheck"},
-                {"label": "গড় সাড়াদান", "valueText": "—", "tone": "lagoon", "icon": "Timer"},
+                {"label": "যাচাইকৃত (ইভেন্ট যোগ্য)", "value": verified_qs.count(), "tone": "emerald", "icon": "CircleCheck"},
+                {"label": "আজ যাচাইকৃত", "value": today_verified, "tone": "lagoon", "icon": "Timer"},
             ],
             "blocks": [
                 {
                     "type": "verificationTable",
-                    "title": "যাচাই সারি",
-                    "items": [serialize_report(r) for r in pending_qs[:50]],
-                }
+                    "title": "রিপোর্ট যাচাই (যেকোনো সময় স্ট্যাটাস বদলান)",
+                    "items": [serialize_report(r) for r in incidents.order_by("-created_at")[:80]],
+                    "hint": "রোতে ক্লিক করে বিস্তারিত দেখুন ও স্ট্যাটাস পরিবর্তন করুন।",
+                    "editableStatus": True,
+                },
+                {
+                    "type": "verifiedTable",
+                    "title": "যাচাইকৃত রিপোর্ট",
+                    "items": verified_items,
+                    "hint": "সত্য হিসেবে যাচাইকৃত ঘটনা — ইভেন্ট তৈরি করতে উদ্ধার কার্যক্রম মেনু ব্যবহার করুন।",
+                },
+                {
+                    "type": "areaIncidentTable",
+                    "title": "এলাকার সকল ঘটনা (জেলা/উপজেলা)",
+                    "items": area_items,
+                },
+            ],
+        }
+
+    def funding(self, user):
+        """Officer's location-based funding requests + create form flag."""
+        qs = ReliefFundingRequest.objects.filter(requested_by=user).order_by("-created_at")
+        pending = qs.filter(status=ReliefFundingRequest.Status.PENDING).count()
+        approved = qs.filter(
+            status__in=[
+                ReliefFundingRequest.Status.APPROVED,
+                ReliefFundingRequest.Status.MODIFIED,
+            ]
+        ).count()
+        return {
+            "stats": [
+                {"label": "অপেক্ষমাণ", "value": pending, "tone": "amber", "icon": "BadgeCheck"},
+                {"label": "অনুমোদিত/সংশোধিত", "value": approved, "tone": "emerald", "icon": "CircleCheck"},
+                {"label": "মোট অনুরোধ", "value": qs.count(), "tone": "lagoon", "icon": "FileText"},
+            ],
+            "blocks": [
+                {
+                    "type": "officerFundingForm",
+                    "title": "নতুন ত্রাণ তহবিল অনুরোধ",
+                    "hint": "একই জেলা+উপজেলার জন্য একটিমাত্র সক্রিয় তহবিল। ঘটনার নাম ও লোকেশন ম্যানুয়ালি দিন।",
+                },
+                {
+                    "type": "fundingTable",
+                    "title": "আমার তহবিল অনুরোধসমূহ",
+                    "items": [r.to_dict() for r in qs[:50]],
+                    "canManage": True,
+                    "readOnly": False,
+                },
             ],
         }
 
     def operations(self, user):
         incidents, *_ = scoped_incidents(user)
         ops = serialize_operations(incidents)
-        running = [o for o in ops if o["status"] == "IN_PROGRESS"]
-        rescued_72 = sum(o["rescued"] for o in ops)
-        teams = sum(o["teams"] for o in running)
+        try:
+            events = [
+                e.to_dict()
+                for e in RescueEvent.objects.select_related("created_by").order_by("-created_at")[:50]
+            ]
+        except Exception:
+            events = []
+        merged = events + ops
+        running = [o for o in merged if o.get("status") == "IN_PROGRESS"]
+        rescued_72 = sum(o.get("rescued") or 0 for o in merged)
+        teams = sum(o.get("teams") or 0 for o in running)
         return {
             "stats": [
                 {"label": "চলমান অভিযান", "value": len(running), "tone": "red", "icon": "LifeBuoy"},
@@ -614,7 +1414,17 @@ class OfficerSectionView(APIView):
                 {"label": "উদ্ধারকৃত (৭২ ঘণ্টা)", "value": rescued_72, "tone": "emerald", "icon": "HandHeart"},
             ],
             "blocks": [
-                {"type": "operationCards", "title": "উদ্ধার অভিযানসমূহ", "items": ops},
+                {
+                    "type": "officerEventForm",
+                    "title": "নতুন উদ্ধার/ত্রাণ ইভেন্ট",
+                    "hint": "জেলা-উপজেলা বেছে ইভেন্ট তৈরি করুন। সেই জেলার স্বেচ্ছাসেবক যোগ দিতে পারবে (সর্বোচ্চ সংখ্যা পর্যন্ত)।",
+                },
+                {
+                    "type": "operationCards",
+                    "title": "উদ্ধার অভিযানসমূহ",
+                    "items": merged,
+                    "canManage": True,
+                },
             ],
         }
 

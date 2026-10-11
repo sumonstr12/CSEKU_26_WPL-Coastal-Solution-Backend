@@ -1,5 +1,3 @@
-
-
 from django.utils import timezone
 
 from alert_notifications.models import NotificationLog
@@ -75,3 +73,48 @@ def mark_one_read(user, pk, read=True):
             row.status = "delivered"
         row.save(update_fields=["read_at", "status"])
     return row
+
+
+def notify_user(user, *, subject, body="", body_bn="", notification_type="assignment"):
+    """Create one in-app notification for a user. Best-effort on schema differences."""
+    if not user:
+        return None
+    payload = {
+        "recipient": user,
+        "subject": subject[:255] if subject else "",
+        "notification_type": notification_type,
+    }
+    # Prefer Bengali body when provided
+    text = body_bn or body or ""
+    field_names = {f.name for f in NotificationLog._meta.get_fields()}
+    if "body_bn" in field_names:
+        payload["body_bn"] = text
+    if "body" in field_names:
+        payload["body"] = body or text
+    if "status" in field_names:
+        payload["status"] = "delivered"
+    try:
+        return NotificationLog.objects.create(**payload)
+    except Exception:
+        # Minimal fallback
+        try:
+            return NotificationLog.objects.create(
+                recipient=user,
+                subject=subject[:255] if subject else "বিজ্ঞপ্তি",
+                notification_type=notification_type,
+            )
+        except Exception:
+            return None
+
+
+def notify_users(users, **kwargs):
+    """Bulk notify; skips None / duplicates."""
+    seen = set()
+    created = 0
+    for u in users:
+        if not u or getattr(u, "id", None) in seen:
+            continue
+        seen.add(u.id)
+        if notify_user(u, **kwargs):
+            created += 1
+    return created

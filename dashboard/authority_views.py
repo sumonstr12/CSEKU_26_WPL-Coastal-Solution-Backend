@@ -48,10 +48,32 @@ from incidents.models import (
 )
 from users.models import AdministrativeArea
 
+# Optional profile model — may not exist in every deployment
+try:
+    from users.models import LocalAuthorityProfile
+except ImportError:  # pragma: no cover
+    LocalAuthorityProfile = None
 
-from users.models import LocalAuthorityProfile
+try:
+    from users.permissions import isLocalAuthority
+except ImportError:  # pragma: no cover
+    isLocalAuthority = None
 
-from users.permissions import IsLocalAuthority
+
+class IsLocalAuthority(BasePermission):
+    """Allow only users with LOCAL_AUTHORITY role (or dedicated permission)."""
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        if isLocalAuthority is not None:
+            try:
+                return bool(isLocalAuthority(user))
+            except Exception:
+                pass
+        role = (getattr(user, "role", None) or "").upper()
+        return role in ("LOCAL_AUTHORITY", "AUTHORITY", "UNO", "UPAZILA_NIRBAHI")
 
 
 AUTHORITY_PERMS = [IsAuthenticated, IsLocalAuthority]
@@ -401,6 +423,125 @@ class AuthorityBadgeView(APIView):
 # REPORTS / VERIFY
 # ============================================================
 
+def _file_url(request, f):
+    """Build absolute URL for a FileField / path string."""
+    if not f:
+        return None
+    try:
+        url = f.url if hasattr(f, "url") else str(f)
+    except Exception:
+        url = str(f)
+    if not url:
+        return None
+    if request and url.startswith("/"):
+        return request.build_absolute_uri(url)
+    return url
+
+
+def collect_evidence(incident, request=None):
+    """
+    Best-effort evidence extraction across common schema names:
+    related: evidence, evidences, media, files, attachments, photos, incident_files
+    fields: file, image, photo, video, media_file, url
+    """
+    items = []
+    seen = set()
+
+    def add(url, kind="file", name=None, mime=None, created=None):
+        if not url or url in seen:
+            return
+        seen.add(url)
+        lower = url.lower().split("?")[0]
+        if kind == "file":
+            if any(lower.endswith(x) for x in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")):
+                kind = "image"
+            elif any(lower.endswith(x) for x in (".mp4", ".webm", ".mov", ".avi", ".mkv")):
+                kind = "video"
+        items.append({
+            "url": url,
+            "kind": kind,
+            "name": name or url.rsplit("/", 1)[-1],
+            "mime": mime,
+            "createdAt": created,
+        })
+
+    # Direct fields on incident
+    for attr in ("photo", "image", "evidence_file", "attachment", "video"):
+        f = getattr(incident, attr, None)
+        if f:
+            add(_file_url(request, f), name=getattr(f, "name", None))
+
+    # Related managers
+    rel_names = (
+        "evidence", "evidences", "media", "files", "attachments",
+        "photos", "incident_files", "incident_media", "report_files",
+        "evidence_set", "media_files",
+    )
+    for rel in rel_names:
+        manager = getattr(incident, rel, None)
+        if manager is None:
+            continue
+        try:
+            qs = manager.all() if hasattr(manager, "all") else manager
+        except Exception:
+            continue
+        try:
+            for obj in qs:
+                url = None
+                kind = getattr(obj, "file_type", None) or getattr(obj, "media_type", None) or "file"
+                name = getattr(obj, "original_name", None) or getattr(obj, "name", None)
+                mime = getattr(obj, "mime_type", None) or getattr(obj, "content_type", None)
+                created = getattr(obj, "created_at", None) or getattr(obj, "uploaded_at", None)
+                for fattr in ("file", "image", "photo", "video", "media_file", "document", "path"):
+                    f = getattr(obj, fattr, None)
+                    if f:
+                        url = _file_url(request, f)
+                        break
+                if not url:
+                    raw = getattr(obj, "url", None)
+                    if raw:
+                        url = _file_url(request, raw)
+                if url:
+                    add(url, kind=str(kind).lower() if kind else "file", name=name, mime=mime, created=created)
+        except Exception:
+            continue
+
+    return items
+
+
+def serialize_report_detail(r, request=None):
+    """Full report payload for authority detail view."""
+    base = serialize_report(r)
+    reporter_phone = None
+    reporter_email = None
+    if r.reporter_id and not getattr(r, "is_anonymous", False):
+        u = r.reporter
+        reporter_phone = getattr(u, "phone", None) or getattr(u, "mobile", None)
+        reporter_email = getattr(u, "email", None)
+
+    lat = getattr(r, "latitude", None) or getattr(r, "lat", None)
+    lng = getattr(r, "longitude", None) or getattr(r, "lng", None) or getattr(r, "lon", None)
+
+    base.update({
+        "address": getattr(r, "address", None) or "",
+        "village": getattr(r, "village", None) or "",
+        "union": getattr(r, "union", None) or getattr(r, "union_name", None) or "",
+        "isSos": bool(getattr(r, "is_sos", False)),
+        "isAnonymous": bool(getattr(r, "is_anonymous", False)),
+        "priority": getattr(r, "priority", None),
+        "severityRaw": getattr(r, "severity", None),
+        "statusRaw": getattr(r, "status", None),
+        "latitude": lat,
+        "longitude": lng,
+        "createdAt": r.created_at,
+        "updatedAt": getattr(r, "updated_at", None),
+        "reporterPhone": reporter_phone,
+        "reporterEmail": reporter_email,
+        "evidence": collect_evidence(r, request=request),
+    })
+    return base
+
+
 class AuthorityReportsView(APIView):
     permission_classes = AUTHORITY_PERMS
 
@@ -408,6 +549,25 @@ class AuthorityReportsView(APIView):
         incidents, *_ = scoped_incidents(request.user)
         rows = [serialize_report(r) for r in incidents.order_by("-created_at")[:200]]
         return Response(rows)
+
+
+class AuthorityReportDetailView(APIView):
+    """
+    GET authority/reports/<pk>/
+    Full report details + evidence for local authority.
+    """
+    permission_classes = AUTHORITY_PERMS
+
+    def get(self, request, pk):
+        incidents, *_ = scoped_incidents(request.user)
+        try:
+            incident = incidents.select_related("category", "reporter").get(pk=pk)
+        except IncidentReport.DoesNotExist:
+            return Response(
+                {"detail": "রিপোর্ট পাওয়া যায়নি বা আপনার এলাকার বাইরে"},
+                status=404,
+            )
+        return Response(serialize_report_detail(incident, request=request))
 
 
 class AuthorityVerifyReportView(APIView):
@@ -539,6 +699,7 @@ class AuthoritySectionView(APIView):
             "rescue-operations": self.operations,
             "areas": self.areas,
             "reports": self.reports_section,
+            "funding": self.funding,
         }
         fn = builders.get(key)
         if not fn:
@@ -565,6 +726,27 @@ class AuthoritySectionView(APIView):
                     "type": "verificationTable",
                     "title": "যাচাই সারি",
                     "items": [serialize_report(r) for r in pending_qs[:50]],
+                }
+            ],
+        }
+
+    def funding(self, user):
+        from dashboard.models import ReliefFundingRequest
+        qs = _authority_funding_qs(user).order_by("-created_at")
+        pending = qs.filter(status=ReliefFundingRequest.Status.PENDING)
+        decided = qs.exclude(status=ReliefFundingRequest.Status.PENDING)
+        return {
+            "stats": [
+                {"label": "অপেক্ষমাণ অনুরোধ", "value": pending.count(), "tone": "amber", "icon": "BadgeCheck"},
+                {"label": "অনুমোদিত/সংশোধিত", "value": decided.filter(status__in=["APPROVED", "MODIFIED"]).count(), "tone": "emerald", "icon": "CircleCheck"},
+                {"label": "প্রত্যাখ্যাত", "value": decided.filter(status="REJECTED").count(), "tone": "red", "icon": "FileText"},
+            ],
+            "blocks": [
+                {
+                    "type": "fundingTable",
+                    "title": "ত্রাণ তহবিল অনুরোধ",
+                    "items": [r.to_dict() for r in qs[:50]],
+                    "hint": "অনুমোদন, প্রত্যাখ্যান বা পরিমাণ সংশোধন করতে পারেন।",
                 }
             ],
         }
@@ -691,3 +873,180 @@ class AuthoritySectionView(APIView):
                 },
             ],
         }
+
+
+# ============================================================
+# RELIEF FUNDING — approve / reject / modify amount
+# ============================================================
+
+def _authority_funding_qs(user):
+    """
+    Only funding for this authority's district.
+    বাগেরহাট authority → only বাগেরহাট rows.
+    """
+    from dashboard.models import ReliefFundingRequest
+
+    qs = ReliefFundingRequest.objects.select_related("requested_by", "decided_by").all()
+    region, district_names, upazila, _ = authority_scope(user)
+
+    if district_names:
+        q = Q()
+        for d in district_names:
+            if not d:
+                continue
+            q |= Q(district__iexact=d) | Q(district__icontains=d)
+        qs = qs.filter(q)
+    else:
+        d = getattr(user, "district", None) or ""
+        if d:
+            qs = qs.filter(Q(district__iexact=d) | Q(district__icontains=d))
+
+    if upazila:
+        qs = qs.filter(Q(upazila="") | Q(upazila__icontains=upazila) | Q(upazila__iexact=upazila))
+
+    return qs
+
+
+class AuthorityFundingListView(APIView):
+    """GET authority/funding/ — pending + recent funding requests."""
+    permission_classes = AUTHORITY_PERMS
+
+    def get(self, request):
+        qs = _authority_funding_qs(request.user).order_by("-created_at")[:100]
+        return Response([r.to_dict() for r in qs])
+
+
+class AuthorityFundingDecideView(APIView):
+    """
+    POST authority/funding/<pk>/decide/
+    Body: { action: "APPROVE"|"REJECT"|"MODIFY", amount?, note? }
+
+    Flow:
+      - MODIFY  → change amount, stay PENDING (officer can still edit; authority can then APPROVE/REJECT)
+      - APPROVE → final accept (uses amount if given, else current requested/proposed)
+      - REJECT  → final reject
+      - Direct APPROVE without MODIFY is allowed
+    """
+    permission_classes = AUTHORITY_PERMS
+
+    def post(self, request, pk):
+        from dashboard.models import ReliefFundingRequest
+
+        try:
+            row = ReliefFundingRequest.objects.get(pk=pk)
+        except ReliefFundingRequest.DoesNotExist:
+            return Response({"detail": "অনুরোধ পাওয়া যায়নি"}, status=404)
+
+        if row.status not in (
+            ReliefFundingRequest.Status.PENDING,
+            ReliefFundingRequest.Status.MODIFIED,
+        ):
+            return Response(
+                {"detail": f"এই অনুরোধ ইতিমধ্যে {row.status} — আর সিদ্ধান্ত নেওয়া যায় না"},
+                status=400,
+            )
+
+        action = (request.data.get("action") or "").upper()
+        note = (request.data.get("note") or request.data.get("authority_note") or "").strip()
+        amount_raw = request.data.get("amount") or request.data.get("approved_amount")
+
+        if action == "MODIFY":
+            # Only adjust amount — still PENDING so can APPROVE / REJECT later
+            try:
+                amt = float(amount_raw) if amount_raw not in (None, "") else float(row.requested_amount)
+            except (TypeError, ValueError):
+                return Response({"detail": "amount অবৈধ"}, status=400)
+            if amt <= 0:
+                return Response({"detail": "amount ০ এর বেশি হতে হবে"}, status=400)
+
+            old_amt = float(row.requested_amount)
+            row.requested_amount = amt
+            row.approved_amount = None  # not final yet
+            row.status = ReliefFundingRequest.Status.PENDING
+            hint = f"কর্তৃপক্ষ পরিমাণ সংশোধন: {old_amt:,.0f} → {amt:,.0f} ৳"
+            row.authority_note = f"{note} | {hint}".strip(" |") if note else hint
+            row.decided_by = request.user
+            row.decided_at = None
+            row.save()
+
+            try:
+                from dashboard.notification_service import notify_users
+                title = getattr(row, "incident_name", None) or f"#{row.id}"
+                notify_users(
+                    [row.requested_by],
+                    subject=f"ত্রাণ তহবিল পরিমাণ সংশোধিত — {title}",
+                    body=(
+                        f"স্থানীয় কর্তৃপক্ষ অনুরোধের পরিমাণ {old_amt:,.0f} থেকে "
+                        f"{amt:,.0f} টাকায় সংশোধন করেছে। এখনও অনুমোদন বাকি। "
+                        + (f"নোট: {note}" if note else "")
+                    ),
+                    body_bn="",
+                    notification_type="assignment",
+                )
+            except Exception:
+                pass
+
+            return Response({
+                **row.to_dict(),
+                "message": f"পরিমাণ সংশোধন হয়েছে ({amt:,.0f} ৳)। এখন অনুমোদন বা প্রত্যাখ্যান করতে পারেন।",
+            })
+
+        if action == "REJECT":
+            row.status = ReliefFundingRequest.Status.REJECTED
+            row.approved_amount = None
+            row.authority_note = note or row.authority_note or ""
+            row.decided_by = request.user
+            row.decided_at = timezone.now()
+            row.save()
+            status_bn = "প্রত্যাখ্যাত"
+        elif action == "APPROVE":
+            # Direct approve OR approve after modify — amount optional
+            try:
+                if amount_raw not in (None, ""):
+                    amt = float(amount_raw)
+                else:
+                    amt = float(row.requested_amount)
+            except (TypeError, ValueError):
+                return Response({"detail": "amount অবৈধ"}, status=400)
+            if amt <= 0:
+                return Response({"detail": "amount ০ এর বেশি হতে হবে"}, status=400)
+
+            original = float(row.requested_amount)
+            row.approved_amount = amt
+            # If approving with different amount, sync request amount and mark MODIFIED
+            if abs(amt - original) > 0.01:
+                row.requested_amount = amt
+                row.status = ReliefFundingRequest.Status.MODIFIED
+                status_bn = "পরিমাণ সংশোধনসহ অনুমোদিত"
+            else:
+                row.status = ReliefFundingRequest.Status.APPROVED
+                status_bn = "অনুমোদিত"
+            if note:
+                row.authority_note = note
+            row.decided_by = request.user
+            row.decided_at = timezone.now()
+            row.save()
+        else:
+            return Response(
+                {"detail": "action হতে হবে APPROVE, REJECT বা MODIFY"},
+                status=400,
+            )
+
+        try:
+            from dashboard.notification_service import notify_users
+            title = getattr(row, "incident_name", None) or f"#{row.id}"
+            notify_users(
+                [row.requested_by],
+                subject=f"ত্রাণ তহবিল {status_bn} — {title}",
+                body=(
+                    f"আপনার ত্রাণ তহবিল অনুরোধ {status_bn}. "
+                    + (f"অনুমোদিত পরিমাণ: {row.approved_amount:,.0f} টাকা. " if row.approved_amount else "")
+                    + (f"নোট: {note}" if note else "")
+                ),
+                body_bn="",
+                notification_type="assignment",
+            )
+        except Exception:
+            pass
+
+        return Response(row.to_dict())

@@ -28,8 +28,10 @@ from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from django.contrib.auth import get_user_model
+
 from dashboard.models import ResponderAvailabilityLog, VolunteerActivity
-from dashboard.notification_service import unread_count
+from dashboard.notification_service import notify_users, unread_count
 from dashboard.officer_views import (
     MAP_DISTRICTS,
     district_risk_rows,
@@ -41,8 +43,16 @@ from dashboard.officer_views import (
     serialize_shelter,
     scoped_shelters,
 )
-from incidents.models import IncidentReport, ResponseAction, ResponseAssignment, Shelter
+from incidents.models import (
+    IncidentReport,
+    ResponseAction,
+    ResponseAssignment,
+    Shelter,
+    VerificationRecord,
+)
 from users.models import AdministrativeArea
+
+User = get_user_model()
 
 try:
     from users.models import CommunityVolunteerProfile
@@ -93,24 +103,63 @@ BN_DUE = {
 }
 
 
+def _safe_profile_qs(model, user):
+    """
+    Load profile without assuming relation names.
+    CommunityVolunteerProfile may use administrative_area (FK) or
+    district/upazila text fields — NOT administrative_areas M2M.
+    """
+    qs = model.objects.filter(user=user)
+    field_names = {f.name for f in model._meta.get_fields()}
+
+    # Single FK (officer-style)
+    if "administrative_area" in field_names:
+        qs = qs.select_related("administrative_area", "administrative_area__parent")
+    # M2M (responder-style) — only if the field really exists
+    elif "administrative_areas" in field_names:
+        qs = qs.prefetch_related("administrative_areas", "administrative_areas__parent")
+
+    return qs.first()
+
+
 def volunteer_profile(user):
     if CommunityVolunteerProfile is not None:
-        p = (
-            CommunityVolunteerProfile.objects
-            .filter(user=user)
-            .prefetch_related("administrative_area", "administrative_area__parent")
-            .first()
-        )
+        p = _safe_profile_qs(CommunityVolunteerProfile, user)
         if p:
             return p
     if VolunteerProfile is not None:
-        return (
-            VolunteerProfile.objects
-            .filter(user=user)
-            .prefetch_related("administrative_areas", "administrative_areas__parent")
-            .first()
-        )
+        return _safe_profile_qs(VolunteerProfile, user)
     return None
+
+
+def _collect_area(area, districts, upazilas):
+    if not area:
+        return
+    at = getattr(area, "area_type", None)
+    if at == "DISTRICT":
+        districts.append(area.name)
+    elif at == "UPAZILA":
+        upazilas.append(area.name)
+        parent = getattr(area, "parent", None)
+        if parent and getattr(parent, "area_type", None) == "DISTRICT":
+            districts.append(parent.name)
+        elif area.parent_id:
+            try:
+                districts.append(area.parent.name)
+            except Exception:
+                pass
+    elif at == "DIVISION":
+        try:
+            districts.extend(
+                list(area.children.filter(area_type="DISTRICT").values_list("name", flat=True))
+            )
+        except Exception:
+            pass
+    elif at == "UNION" and area.parent_id:
+        try:
+            upazilas.append(area.parent.name)
+        except Exception:
+            pass
 
 
 def scope_parts(user):
@@ -118,38 +167,37 @@ def scope_parts(user):
     profile = volunteer_profile(user)
     districts, upazilas = [], []
 
-    if profile and hasattr(profile, "administrative_areas"):
-        for area in profile.administrative_areas.all():
-            if area.area_type == "DISTRICT":
-                districts.append(area.name)
-            elif area.area_type == "UPAZILA":
-                upazilas.append(area.name)
-                if area.parent_id and getattr(area.parent, "area_type", None) == "DISTRICT":
-                    districts.append(area.parent.name)
-            elif area.area_type == "DIVISION":
-                districts.extend(
-                    list(area.children.filter(area_type="DISTRICT").values_list("name", flat=True))
-                )
-            elif area.area_type == "UNION" and area.parent_id:
-                upazilas.append(area.parent.name)
+    if profile:
+        field_names = {f.name for f in profile._meta.get_fields()}
 
-    # Single FK style profile (like officer)
-    area = getattr(profile, "administrative_area", None) if profile else None
-    if area:
-        if area.area_type == "UPAZILA":
-            upazilas.append(area.name)
-            if area.parent_id:
-                districts.append(area.parent.name)
-        elif area.area_type == "DISTRICT":
-            districts.append(area.name)
-        elif area.area_type == "DIVISION":
-            districts.extend(
-                list(area.children.filter(area_type="DISTRICT").values_list("name", flat=True))
-            )
+        # M2M administrative_areas
+        if "administrative_areas" in field_names:
+            try:
+                for area in profile.administrative_areas.all():
+                    _collect_area(area, districts, upazilas)
+            except Exception:
+                pass
+
+        # Single FK administrative_area
+        if "administrative_area" in field_names:
+            _collect_area(getattr(profile, "administrative_area", None), districts, upazilas)
+
+        # Plain text fields on profile
+        for attr, bucket in (
+            ("district", districts),
+            ("upazila", upazilas),
+            ("assigned_district", districts),
+            ("assigned_upazila", upazilas),
+        ):
+            if attr in field_names:
+                val = getattr(profile, attr, None)
+                if val and isinstance(val, str):
+                    bucket.append(val)
 
     districts = list(dict.fromkeys([d for d in districts if d]))
     upazilas = list(dict.fromkeys([u for u in upazilas if u]))
 
+    # Fallback: custom User model fields
     if not districts and getattr(user, "district", None):
         districts = [user.district]
     if not upazilas and getattr(user, "upazila", None):
@@ -311,8 +359,32 @@ def build_tasks(user, limit=30):
 
 def build_operations_for_volunteer(user):
     """Area rescue/relief operations with join state for this volunteer."""
-    incidents, *_ = scoped_incidents(user)
+    incidents, profile, region, districts, upazilas = scoped_incidents(user)
     ops = serialize_operations(incidents)
+
+    # Officer-created location events for volunteer's district
+    try:
+        from dashboard.models import RescueEvent
+        eq = RescueEvent.objects.filter(status=RescueEvent.Status.OPEN).select_related("created_by")
+        if districts:
+            from django.db.models import Q
+            q = Q()
+            for d in districts:
+                q |= Q(district__iexact=d) | Q(district__icontains=d)
+            # also user.district
+            ud = getattr(user, "district", None)
+            if ud:
+                q |= Q(district__iexact=ud) | Q(district__icontains=ud)
+            eq = eq.filter(q)
+        else:
+            ud = getattr(user, "district", None)
+            if ud:
+                eq = eq.filter(district__icontains=ud)
+        for e in eq.order_by("-created_at")[:40]:
+            ops.insert(0, e.to_dict())
+    except Exception:
+        pass
+
     joined_keys = set(
         VolunteerActivity.objects.filter(
             user=user,
@@ -329,11 +401,21 @@ def build_operations_for_volunteer(user):
     out = []
     for o in ops:
         key = str(o.get("id") or "")
-        row = {**o, "canJoin": True, "joined": key in joined_keys, "completed": key in joined_done}
+        can_join = o.get("canJoin", True)
+        if o.get("isLocationEvent") and o.get("canJoin") is False:
+            can_join = False
+        row = {
+            **o,
+            "canJoin": can_join and key not in joined_keys and key not in joined_done,
+            "joined": key in joined_keys,
+            "completed": key in joined_done,
+        }
         if row["joined"]:
             row["joinLabel"] = "অংশগ্রহণরত"
         elif row["completed"]:
             row["joinLabel"] = "সম্পন্ন"
+        elif not row["canJoin"] and o.get("isLocationEvent"):
+            row["joinLabel"] = "পূর্ণ"
         else:
             row["joinLabel"] = "অংশ নিন"
         out.append(row)
@@ -623,6 +705,123 @@ class VolunteerBadgeView(APIView):
 # REPORTS / SHELTERS / MAP
 # ============================================================
 
+def collect_evidence_urls(incident, request=None):
+    """Evidence from EvidenceAttachment.file_url (Supabase public links)."""
+    items = []
+    seen = set()
+
+    def add(url, kind="file", name=None):
+        if not url or url in seen:
+            return
+        seen.add(url)
+        if request and str(url).startswith("/"):
+            url = request.build_absolute_uri(url)
+        lower = str(url).lower().split("?")[0]
+        if kind in ("file", "document", "photo"):
+            if kind == "photo" or any(lower.endswith(x) for x in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")):
+                kind = "image"
+            elif any(lower.endswith(x) for x in (".mp4", ".webm", ".mov", ".avi", ".mkv")):
+                kind = "video"
+        items.append({
+            "url": url,
+            "kind": kind,
+            "name": name or str(url).rsplit("/", 1)[-1],
+        })
+
+    try:
+        from incidents.models import EvidenceAttachment
+        for ev in EvidenceAttachment.objects.filter(incident=incident).order_by("id"):
+            url = getattr(ev, "file_url", None) or getattr(ev, "file_path", None)
+            kind = getattr(ev, "file_type", None) or "file"
+            name = getattr(ev, "original_file_name", None) or getattr(ev, "file_name", None)
+            add(url, kind=kind, name=name)
+    except Exception:
+        pass
+
+    if items:
+        return items
+
+    for rel in ("evidence", "evidences", "media", "files", "attachments"):
+        mgr = getattr(incident, rel, None)
+        if not mgr or not hasattr(mgr, "all"):
+            continue
+        try:
+            for obj in mgr.all():
+                url = getattr(obj, "file_url", None) or getattr(obj, "url", None)
+                f = getattr(obj, "file", None) or getattr(obj, "image", None)
+                if f and hasattr(f, "url"):
+                    url = f.url
+                kind = getattr(obj, "file_type", None) or "file"
+                add(url, kind=kind, name=getattr(obj, "original_file_name", None) or getattr(obj, "name", None))
+        except Exception:
+            continue
+    return items
+
+
+def serialize_report_detail(r, request=None):
+    """Safe detail payload — never raises on missing optional fields."""
+    try:
+        base = serialize_report(r)
+    except Exception:
+        cat = getattr(r, "category", None)
+        base = {
+            "id": r.id,
+            "type": "flood",
+            "title": getattr(r, "title_bn", None) or getattr(r, "title", None) or f"রিপোর্ট #{r.id}",
+            "description": getattr(r, "description_bn", None) or getattr(r, "description", None) or "",
+            "district": getattr(r, "district", None) or "",
+            "upazila": getattr(r, "upazila", None) or "",
+            "place": getattr(r, "village", None) or getattr(r, "address", None) or "",
+            "severity": "MODERATE",
+            "status": "PENDING",
+            "incident_time": getattr(r, "incident_time", None),
+            "time": getattr(r, "incident_time", None) or getattr(r, "created_at", None),
+            "affected": getattr(r, "affected_people_estimate", None),
+            "category": {"id": getattr(r, "category_id", None)} if getattr(r, "category_id", None) else {},
+            "reporter": None,
+        }
+
+    reporter_phone = None
+    try:
+        if r.reporter_id and not getattr(r, "is_anonymous", False):
+            u = r.reporter
+            reporter_phone = getattr(u, "phone", None) or getattr(u, "mobile", None)
+            if not base.get("reporter"):
+                name = getattr(u, "full_name", None) or getattr(u, "username", None)
+                if name:
+                    base["reporter"] = {"name": name}
+    except Exception:
+        pass
+
+    lat = getattr(r, "latitude", None) or getattr(r, "lat", None)
+    lng = getattr(r, "longitude", None) or getattr(r, "lng", None) or getattr(r, "lon", None)
+    status_raw = (getattr(r, "status", None) or "").lower()
+
+    evidence = []
+    try:
+        evidence = collect_evidence_urls(r, request=request)
+    except Exception:
+        evidence = []
+
+    base.update({
+        "address": getattr(r, "address", None) or "",
+        "village": getattr(r, "village", None) or "",
+        "union": getattr(r, "union", None) or "",
+        "isSos": bool(getattr(r, "is_sos", False)),
+        "isAnonymous": bool(getattr(r, "is_anonymous", False)),
+        "situation": getattr(r, "situation", None) or "",
+        "latitude": lat,
+        "longitude": lng,
+        "createdAt": getattr(r, "created_at", None),
+        "updatedAt": getattr(r, "updated_at", None),
+        "reporterPhone": reporter_phone,
+        "affectedFamilies": getattr(r, "affected_families_estimate", None),
+        "evidence": evidence,
+        "canVerify": status_raw in ("submitted", "pending", "under_review"),
+    })
+    return base
+
+
 class VolunteerReportsView(APIView):
     permission_classes = PERMS
 
@@ -630,6 +829,58 @@ class VolunteerReportsView(APIView):
         incidents, *_ = scoped_incidents(request.user)
         rows = [serialize_report(r) for r in incidents.order_by("-created_at")[:200]]
         return Response(rows)
+
+
+class VolunteerReportDetailView(APIView):
+    """
+    GET volunteer/reports/<pk>/
+    Full incident detail + evidence (Supabase file_url) for volunteer review before verify.
+    """
+    permission_classes = PERMS
+
+    def get(self, request, pk):
+        incident = None
+        # 1) Prefer area-scoped report
+        try:
+            incidents, *_ = scoped_incidents(request.user)
+            incident = incidents.select_related("category", "reporter").filter(pk=pk).first()
+        except Exception:
+            incident = None
+
+        # 2) Fallback: any report by id (so detail never 404 if list showed it)
+        if incident is None:
+            try:
+                incident = (
+                    IncidentReport.objects
+                    .select_related("category", "reporter")
+                    .filter(pk=pk)
+                    .first()
+                )
+            except Exception:
+                incident = None
+
+        if incident is None:
+            return Response(
+                {"detail": f"রিপোর্ট #{pk} পাওয়া যায়নি"},
+                status=404,
+            )
+
+        try:
+            payload = serialize_report_detail(incident, request=request)
+            return Response(payload)
+        except Exception as exc:
+            # Last-resort minimal payload so modal still opens
+            return Response({
+                "id": incident.id,
+                "title": getattr(incident, "title", None) or f"রিপোর্ট #{pk}",
+                "description": getattr(incident, "description", None) or "",
+                "district": getattr(incident, "district", None) or "",
+                "upazila": getattr(incident, "upazila", None) or "",
+                "status": "PENDING",
+                "evidence": [],
+                "canVerify": True,
+                "detail_error": str(exc),
+            })
 
 
 class VolunteerSheltersView(APIView):
@@ -739,11 +990,13 @@ class VolunteerSectionView(APIView):
         now = timezone.now()
         today = now.replace(hour=0, minute=0, second=0, microsecond=0)
         today_count = incidents.filter(created_at__gte=today).count()
-        pending = incidents.filter(status__in=PENDING_STATUSES).count()
+        pending_qs = incidents.filter(status__in=PENDING_STATUSES).order_by("-created_at")
+        pending = pending_qs.count()
         high = incidents.filter(priority__in=["high", "critical"]).exclude(
             status__in=["resolved", "closed", "rejected"]
         ).count()
         rows = [serialize_report(r) for r in incidents.order_by("-created_at")[:100]]
+        pending_rows = [serialize_report(r) for r in pending_qs[:50]]
         return {
             "stats": [
                 {
@@ -758,10 +1011,16 @@ class VolunteerSectionView(APIView):
             ],
             "blocks": [
                 {
+                    "type": "verificationTable",
+                    "title": "লোকেশন ও রিপোর্ট যাচাই সারি",
+                    "subtitle": "যাচাই করলে এলাকায় উদ্ধার অভিযান তৈরি হবে এবং স্থানীয় স্বেচ্ছাসেবকরা নোটিফিকেশন পাবেন",
+                    "items": pending_rows,
+                },
+                {
                     "type": "reportTable",
                     "title": f"কমিউনিটি রিপোর্ট ({region})",
                     "items": rows,
-                }
+                },
             ],
         }
 
@@ -1106,6 +1365,26 @@ class VolunteerJoinOperationView(APIView):
         if not op:
             return Response({"detail": "Operation not found in your area"}, status=404)
 
+        # Location event capacity check
+        if op_key.upper().startswith("EV-"):
+            try:
+                from dashboard.models import RescueEvent
+                eid = int(op_key.split("-", 1)[1])
+                ev = RescueEvent.objects.filter(pk=eid).first()
+                if not ev:
+                    return Response({"detail": "ইভেন্ট পাওয়া যায়নি"}, status=404)
+                if ev.status != RescueEvent.Status.OPEN:
+                    return Response({"detail": "ইভেন্ট বন্ধ"}, status=400)
+                if ev.joined_total() >= ev.max_volunteers:
+                    return Response(
+                        {"detail": f"সর্বোচ্চ {ev.max_volunteers} জন স্বেচ্ছাসেবক — আর জায়গা নেই"},
+                        status=400,
+                    )
+                if kind not in ("RELIEF", "RESCUE"):
+                    kind = ev.mission_type
+            except Exception as exc:
+                return Response({"detail": str(exc)}, status=400)
+
         # Extract incident id from OP-{id}
         incident_id = None
         if op_key.upper().startswith("OP-"):
@@ -1128,6 +1407,24 @@ class VolunteerJoinOperationView(APIView):
             people_helped=0,
         )
         return Response(act.to_task_dict(), status=201)
+
+
+
+class VolunteerLeaveOperationView(APIView):
+    """
+    POST volunteer/operations/<key>/leave/
+    Volunteer leaves a joined operation/event.
+    """
+    permission_classes = PERMS
+
+    def post(self, request, key):
+        user = request.user
+        op_key = str(key)
+        acts = VolunteerActivity.objects.filter(user=user, operation_key=op_key)
+        if not acts.exists():
+            return Response({"detail": "আপনি এই ইভেন্টে যুক্ত নন"}, status=404)
+        deleted, _ = acts.delete()
+        return Response({"detail": "ইভেন্ট থেকে বেরিয়ে এসেছেন", "id": op_key, "removed": deleted})
 
 
 # ============================================================
@@ -1157,3 +1454,164 @@ class VolunteerActivitiesView(APIView):
                 "peopleHelped": people,
             },
         })
+
+
+
+# ============================================================
+# VERIFY REPORT + CREATE RESCUE OPERATION + NOTIFY
+# ============================================================
+
+def area_volunteers(district, upazila=None, exclude_user=None):
+    """
+    Volunteers in the same district (zilla). Upazila is optional soft filter —
+    primary match is district so all district volunteers get the operation invite.
+    """
+    roles = ["COMMUNITY_VOLUNTEER", "VOLUNTEER"]
+    qs = User.objects.filter(role__in=roles)
+    if exclude_user is not None:
+        qs = qs.exclude(pk=exclude_user.pk)
+
+    if not district:
+        return list(qs[:80])
+
+    # User.district text field
+    by_user = list(qs.filter(district__icontains=district)[:80])
+    found_ids = {u.pk for u in by_user}
+
+    # CommunityVolunteerProfile.district if present
+    try:
+        from users.models import CommunityVolunteerProfile
+        profile_qs = CommunityVolunteerProfile.objects.filter(
+            user__role__in=roles,
+            district__icontains=district,
+        ).select_related("user")
+        if exclude_user is not None:
+            profile_qs = profile_qs.exclude(user_id=exclude_user.pk)
+        for p in profile_qs[:80]:
+            if p.user_id not in found_ids:
+                by_user.append(p.user)
+                found_ids.add(p.user_id)
+    except Exception:
+        pass
+
+    return by_user[:80]
+
+
+def create_operation_for_incident(incident, leader_user):
+    """
+    Ensure a ResponseAssignment exists for this incident (acts as rescue op seed).
+    Returns (operation_key, assignment_or_None).
+    """
+    op_key = f"OP-{incident.id}"
+    asg = (
+        ResponseAssignment.objects
+        .filter(incident=incident)
+        .exclude(status__in=["declined", "cancelled"])
+        .order_by("-created_at")
+        .first()
+    )
+    if not asg:
+        try:
+            asg = ResponseAssignment.objects.create(
+                incident=incident,
+                status="pending",
+            )
+        except Exception:
+            # Schema may require assigned_to — still return logical op key
+            asg = None
+
+    # Leader's own activity as operation participation
+    VolunteerActivity.objects.get_or_create(
+        user=leader_user,
+        operation_key=op_key,
+        defaults={
+            "title": incident.title_bn or incident.title or f"উদ্ধার অভিযান #{incident.id}",
+            "place": place_of(incident),
+            "detail": (incident.description_bn or incident.description or "")[:500],
+            "kind": VolunteerActivity.Kind.RESCUE,
+            "status": VolunteerActivity.Status.ONGOING,
+            "incident_id": incident.id,
+            "assignment_id": asg.id if asg else None,
+            "due_label": "চলমান",
+        },
+    )
+    return op_key, asg
+
+
+class VolunteerVerifyReportView(APIView):
+    """
+    Volunteer verifies a local report only — does NOT create rescue operations.
+    Officer announces events from verified reports; volunteers may then attend/join.
+
+    POST body: { "action": "VERIFY" | "REJECT" }
+    """
+    permission_classes = PERMS
+
+    def post(self, request, pk):
+        user = request.user
+        action = (request.data.get("action") or "").upper()
+
+        incidents, *_ = scoped_incidents(user)
+        try:
+            incident = incidents.get(pk=pk)
+        except IncidentReport.DoesNotExist:
+            # fallback: allow by id if scoped miss
+            try:
+                incident = IncidentReport.objects.get(pk=pk)
+            except IncidentReport.DoesNotExist:
+                return Response(
+                    {"detail": "রিপোর্ট আপনার এলাকায় নেই বা পাওয়া যায়নি"},
+                    status=404,
+                )
+
+        if action == "VERIFY":
+            incident.status = "verified"
+            try:
+                incident.save(update_fields=["status", "updated_at"])
+            except Exception:
+                incident.save(update_fields=["status"])
+
+            try:
+                VerificationRecord.objects.create(
+                    incident=incident,
+                    verifier=user,
+                    status="verified",
+                    priority_assigned=getattr(incident, "priority", None),
+                    severity_assigned=getattr(incident, "severity", None),
+                )
+            except Exception:
+                try:
+                    VerificationRecord.objects.create(
+                        incident=incident,
+                        verifier=user,
+                        status="verified",
+                    )
+                except Exception:
+                    pass
+
+            return Response({
+                "id": incident.id,
+                "action": "VERIFY",
+                "status": "VERIFIED",
+                "operation": None,
+                "notified": 0,
+                "message": "যাচাই সম্পন্ন। অফিসার ইভেন্ট ঘোষণা করলে আপনি অংশ নিতে পারবেন।",
+            })
+
+        if action == "REJECT":
+            incident.status = "rejected"
+            try:
+                incident.save(update_fields=["status", "updated_at"])
+            except Exception:
+                incident.save(update_fields=["status"])
+            try:
+                VerificationRecord.objects.create(
+                    incident=incident,
+                    verifier=user,
+                    status="rejected",
+                )
+            except Exception:
+                pass
+            return Response({"id": incident.id, "action": "REJECT", "status": "REJECTED"})
+
+        return Response({"detail": "Invalid action"}, status=400)
