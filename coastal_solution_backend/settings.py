@@ -28,7 +28,13 @@ DEBUG = os.getenv('DEBUG', 'False').lower() in ('1', 'true', 'yes', 'on')
 ALLOWED_HOSTS = ["localhost", "127.0.0.1"]
 
 CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:5173",
+    "https://coastal-disaster-solution.vercel.app",
+    "https://localhost",  # Capacitor Android
+]
+
+CORS_ALLOWED_ORIGINS = [
+    "https://coastal-disaster-solution.vercel.app",
+    "https://localhost",  # Capacitor Android
 ]
 
 SESSION_COOKIE_SAMESITE = "Lax"
