@@ -26,6 +26,7 @@ DEBUG = os.getenv('DEBUG', 'False').lower() in ('1', 'true', 'yes', 'on')
 
 # ALLOWED_HOSTS = []
 
+
 ALLOWED_HOSTS = [
     "localhost",
     "127.0.0.1",
@@ -36,11 +37,13 @@ CSRF_TRUSTED_ORIGINS = [
     "https://coastal-disaster-solution.vercel.app",
     "https://cseku-26-wpl-coastal-solution-backend.onrender.com",
     "https://localhost",  # Capacitor Android
+    "http://localhost:5173",  # Local development
 ]
 
 CORS_ALLOWED_ORIGINS = [
     "https://coastal-disaster-solution.vercel.app",
     "https://localhost",  # Capacitor Android
+    "http://localhost:5173",  # Local development
 ]
 
 CORS_ALLOW_CREDENTIALS = True
@@ -88,11 +91,6 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-]
-
-CORS_ALLOW_CREDENTIALS = True
 
 ROOT_URLCONF = 'coastal_solution_backend.urls'
 
