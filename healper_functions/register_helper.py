@@ -1,9 +1,14 @@
 from django.contrib.auth import get_user_model
+
+from healper_functions import sms_service
+from healper_functions.sms_service import send_otp_sms
 from users.models import *
+from .sms_service import send_otp_sms
 User = get_user_model()
 
 def send_sms(phone_number, otp):
-    print(f"--- [SMS SENT] To: {phone_number} | OTP: {otp} ---")
+    success = send_otp_sms(phone_number, otp)
+    print(success)
 
 def create_role_profile(user):
     if user.role == User.Role.CITIZEN:
