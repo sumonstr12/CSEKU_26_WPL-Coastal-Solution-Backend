@@ -11,6 +11,7 @@ def send_otp_sms(phone_number: str, otp: str) -> bool:
         raise RuntimeError("SMS_BD_API_KEY is not configured")
 
     phone = phone_number.strip().replace(" ", "")
+				print(f"oto {otp}")
 
     if phone.startswith("+880"):
         phone = phone[1:]
