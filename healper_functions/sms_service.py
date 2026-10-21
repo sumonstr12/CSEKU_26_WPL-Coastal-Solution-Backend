@@ -1,7 +1,6 @@
 
 import os
 import requests
-from django.conf import settings
 
 
 def send_otp_sms(phone_number: str, otp: str) -> bool:
@@ -11,8 +10,10 @@ def send_otp_sms(phone_number: str, otp: str) -> bool:
         raise RuntimeError("SMS_BD_API_KEY is not configured")
 
     phone = phone_number.strip().replace(" ", "")
-	print(f"OTP for verification - {otp}")
 
+    print(f"OTP for verification: {otp}", flush=True)
+
+    # Normalize Bangladesh phone number
     if phone.startswith("+880"):
         phone = phone[1:]
     elif phone.startswith("880"):
@@ -24,20 +25,35 @@ def send_otp_sms(phone_number: str, otp: str) -> bool:
 
     payload = {
         "api_key": api_key,
-        "msg":  "Coastal Disaster Solution"
-                f"Your verification code is {otp}. "
-               "Do not share this code.",
+        "msg": (
+            "Coastal Disaster Solution: "
+            f"Your verification code is {otp}. "
+            "Do not share this code."
+        ),
         "to": phone,
     }
 
-    response = requests.post(
-        "https://api.sms.net.bd/sendsms",
-        data=payload,
-        timeout=15,
-    )
-    response.raise_for_status()
+    try:
+        response = requests.post(
+            "https://api.sms.net.bd/sendsms",
+            data=payload,
+            timeout=15,
+        )
 
-    result = response.json()
+        response.raise_for_status()
+        result = response.json()
 
-    # API reports error=0 for successful submission.
-    return result.get("error") == 0
+        # SMS provider reports error=0 on successful submission
+        if result.get("error") == 0:
+            print("OTP SMS submitted successfully", flush=True)
+            return True
+
+        print(
+            f"SMS provider returned an error: {result.get('error')}",
+            flush=True,
+        )
+        return False
+
+    except requests.RequestException as exc:
+        print(f"Failed to send OTP SMS: {exc}", flush=True)
+        raise
